@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 loguru==0.7.3
 aiohttp==3.11.12
 base58==2.1.1
+rich==13.9.4

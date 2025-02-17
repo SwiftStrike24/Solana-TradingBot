@@ -1,15 +1,29 @@
 import logging
 from solana.rpc.api import Client
-from src.config.settings import HELIUS_RPC_URL, LOG_FILE, LOG_LEVEL
+from src.config.settings import HELIUS_RPC_URL, LOG_LEVEL
+import sys
 
-def setup_logging():
+def setup_logging(log_file=None):
     """Configure logging for the bot."""
+    if log_file is None:
+        log_file = "logs/trading_bot.log"
+        
+    log_format = (
+        '%(asctime)s | '
+        '%(levelname)-8s | '
+        '%(name)-12s | '
+        '%(message)s'
+    )
+    
+    date_format = '%Y-%m-%d %I:%M:%S %p'
+    
     logging.basicConfig(
         level=LOG_LEVEL,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        format=log_format,
+        datefmt=date_format,
         handlers=[
-            logging.FileHandler(LOG_FILE),
-            logging.StreamHandler()
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
         ]
     )
     return logging.getLogger(__name__)
