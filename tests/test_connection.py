@@ -56,12 +56,21 @@ def format_swap_quote(quote):
         in_token = swap['inputMint'][:4] + "..." + swap['inputMint'][-4:]
         out_token = swap['outputMint'][:4] + "..." + swap['outputMint'][-4:]
         
+        # Handle fee amount and symbol
+        if (swap['feeMint'] == "11111111111111111111111111111111" or 
+            swap['feeMint'] == "So11111111111111111111111111111111111111112"):
+            fee_amount = float(swap['feeAmount'])/1e9
+            fee_symbol = "SOL"
+        else:
+            fee_amount = float(swap['feeAmount'])/1e9  # Default to SOL decimals
+            fee_symbol = "..."
+
         route_table.add_row(
             f"#{idx}",
             f"🏦 {swap['label']}",
             f"{in_token} → {out_token}",
             f"💰 {float(swap['outAmount'])/1e9:.4f}",
-            f"🔸 {float(swap['feeAmount'])/1e9:.6f}"
+            f"🔸 {fee_amount:.6f} {fee_symbol}"
         )
 
     # Combine everything into a panel
