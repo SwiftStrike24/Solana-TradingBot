@@ -1,5 +1,6 @@
 import logging
 from solana.rpc.api import Client
+from solders.pubkey import Pubkey
 from src.config.settings import HELIUS_RPC_URL, LOG_LEVEL
 import sys
 
@@ -42,8 +43,28 @@ def calculate_price_impact(input_amount: float, output_amount: float) -> float:
 
 def is_valid_token_address(client: Client, address: str) -> bool:
     """Verify if an address is a valid SPL token."""
+    logger = logging.getLogger(__name__)
     try:
-        response = client.get_account_info(address)
-        return bool(response['result']['value'])
-    except Exception:
+        # Validate and convert to Pubkey
+        token_pubkey = Pubkey.from_string(address)
+            
+        response = client.get_account_info(
+            str(token_pubkey),
+            encoding="jsonParsed",
+            commitment="confirmed"
+        )
+        
+        account_data = response.get('result', {}).get('value')
+        if not account_data:
+            return False
+            
+        # Check if it's a token account
+        program = account_data.get('owner')
+        return program == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        
+    except ValueError as e:
+        logger.error(f"Invalid address format: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error validating token address: {e}")
         return False 
