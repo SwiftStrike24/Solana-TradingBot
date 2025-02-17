@@ -15,15 +15,21 @@ class TradingBot:
     def get_token_price(self, token_address: str) -> Optional[float]:
         """Get token price in SOL."""
         try:
-            url = f"{self.jupiter_base_url}/price"
+            # Use Jupiter's quote endpoint instead of price endpoint
+            url = f"{self.jupiter_base_url}/quote"
             params = {
-                "inputMint": token_address,
-                "outputMint": "So11111111111111111111111111111111111111112",  # SOL
-                "amount": format_amount(1)
+                "inputMint": "So11111111111111111111111111111111111111112",  # SOL
+                "outputMint": token_address,
+                "amount": "1000000000",  # 1 SOL in lamports
+                "slippageBps": 50
             }
             response = requests.get(url, params=params)
             data = response.json()
-            return float(data['price'])
+            
+            # Calculate price from the quote
+            if 'outAmount' in data:
+                return float(data['outAmount']) / 1000000000  # Convert to human readable
+            return None
         except Exception as e:
             logger.error(f"Error getting token price: {e}")
             return None
@@ -31,11 +37,22 @@ class TradingBot:
     def check_liquidity(self, token_address: str) -> bool:
         """Check if token has sufficient liquidity."""
         try:
-            price = self.get_token_price(token_address)
-            if price is None:
-                return False
-            # Simple liquidity check - can be enhanced
-            return price * format_amount(1) >= MIN_LIQUIDITY_SOL
+            # Get quote for 1 SOL
+            url = f"{self.jupiter_base_url}/quote"
+            params = {
+                "inputMint": "So11111111111111111111111111111111111111112",  # SOL
+                "outputMint": token_address,
+                "amount": "1000000000",  # 1 SOL
+                "slippageBps": 50
+            }
+            response = requests.get(url, params=params)
+            data = response.json()
+            
+            # Check if route exists and price impact is reasonable
+            if 'priceImpactPct' in data:
+                price_impact = float(data['priceImpactPct'])
+                return price_impact < 5.0  # Less than 5% price impact
+            return False
         except Exception as e:
             logger.error(f"Error checking liquidity: {e}")
             return False
