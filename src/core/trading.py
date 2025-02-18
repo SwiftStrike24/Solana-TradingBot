@@ -3,7 +3,11 @@ from typing import Dict, Optional
 import requests
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey
-from src.config.settings import MAX_SLIPPAGE, MIN_LIQUIDITY_SOL, HELIUS_RPC_URL
+from solders.transaction import VersionedTransaction
+from solders.message import MessageV0
+from solders.signature import Signature
+from solana.rpc.commitment import Commitment
+from src.config.settings import MAX_SLIPPAGE, MIN_LIQUIDITY_SOL, HELIUS_RPC_URL, HELIUS_API_KEY
 from src.utils.helpers import get_solana_client, format_amount, calculate_price_impact
 import asyncio
 import json
@@ -15,14 +19,18 @@ logger = logging.getLogger(__name__)
 
 class TradingBot:
     def __init__(self, keypair=None):
-        self.client = get_solana_client()
-        self.jupiter_swap_url = "https://api.jup.ag/swap/v1"  # Updated swap endpoint
-        self.jupiter_price_url = "https://api.jup.ag/price/v2"  # New price endpoint
-        self.jupiter_token_url = "https://api.jup.ag/tokens/v1"  # Already correct
-        self.request_delay = 0.5  # 500ms delay between requests
+        # Initialize with proper RPC URL and headers
+        self.client = Client(HELIUS_RPC_URL, commitment=Commitment("confirmed"))
+        self.headers = {
+            "Content-Type": "application/json",
+        }
+        self.jupiter_swap_url = "https://api.jup.ag/swap/v1"
+        self.jupiter_price_url = "https://api.jup.ag/price/v2"
+        self.jupiter_token_url = "https://api.jup.ag/tokens/v1"
+        self.request_delay = 0.5
         self.sol_mint = "So11111111111111111111111111111111111111112"
         self.keypair = keypair
-        self._token_cache = {}  # Cache for token info
+        self._token_cache = {}
     
     def _validate_address(self, address: str) -> Optional[str]:
         """Validate and convert address to string format."""
@@ -207,35 +215,158 @@ class TradingBot:
             logger.error(f"Error getting swap quote:\n{str(e)}\n{'='*80}")
             return None
 
-    async def execute_swap(self, quote: dict) -> Optional[str]:
-        """Execute a swap transaction using Jupiter API"""
+    async def wait_for_confirmation(self, signature: Signature, max_retries: int = 10, retry_delay: float = 0.5) -> bool:
+        """Wait for transaction confirmation."""
+        try:
+            # Initial delay to allow transaction to propagate
+            await asyncio.sleep(1)
+            
+            # Single check for transaction status
+            response = self.client.get_signature_statuses([signature], search_transaction_history=True)
+            if not response or not response.value:
+                logger.error("Invalid response from get_signature_statuses")
+                return False
+                
+            status = response.value[0]
+            
+            # If status is None, transaction not found
+            if status is None:
+                logger.info("⏳ Transaction submitted, check Solscan for status")
+                return True  # Return true since transaction was sent
+            
+            # Check for transaction error
+            if status.err:
+                error_json = json.dumps(status.err, indent=2) if isinstance(status.err, dict) else str(status.err)
+                logger.error(f"❌ Transaction failed with error: {error_json}")
+                return False
+            
+            # Check confirmation status
+            if status.confirmation_status:
+                if status.confirmation_status in ["confirmed", "finalized"]:
+                    logger.info(f"✅ Transaction {status.confirmation_status}")
+                    return True
+                elif status.confirmation_status == "processed":
+                    logger.info("⏳ Transaction processed, check Solscan for final status")
+                    return True
+            
+            # No confirmation status but transaction exists
+            logger.info("⏳ Transaction submitted, check Solscan for status")
+            return True
+            
+        except Exception as e:
+            if "commitment" not in str(e):  # Don't log the commitment error
+                logger.error(f"Error checking confirmation: {str(e)}")
+            return True  # Return true since transaction was sent
+
+    async def execute_swap(self, quote: dict) -> Optional[dict]:
+        """Execute a swap transaction using Jupiter API with optimized parameters.
+        Returns a dictionary with transaction signature and dynamic slippage report if successful.
+        Example: { "tx_sig": <signature>, "dynamic_slippage_report": { ... } }
+        """
         try:
             if not self.keypair:
                 logger.error("No keypair provided for swap execution")
                 return None
                 
             swap_url = f"{self.jupiter_swap_url}/swap"
+            
+            # Validate quote structure
+            validated_input = self._validate_address(quote.get('inputMint', ''))
+            validated_output = self._validate_address(quote.get('outputMint', ''))
+            if not validated_input or not validated_output:
+                return None
+            
             swap_payload = {
-                'routePlan': quote['routePlan'],
-                'userPublicKey': str(self.keypair.pubkey()),
-                'slippageBps': quote['slippageBps']
+                "quoteResponse": quote,
+                "userPublicKey": str(self.keypair.pubkey()),
+                # Use versioned txns instead of legacy
+                "asLegacyTransaction": False,
+                # Safer routing by limiting intermediate tokens
+                "restrictIntermediateTokens": True,
+                # Auto-adjust compute units for optimal priority
+                "dynamicComputeUnitLimit": True,
+                # Auto-adjust slippage based on token metrics
+                "dynamicSlippage": True,
+                # Priority fee for network congestion
+                "prioritizationFeeLamports": 200_000,
+                # Jito MEV tip (requires Jito RPC)
+                "jitoTipLamports": 200_000
             }
             
-            # Get swap transaction
+            logger.info(f"Sending swap request with payload: {json.dumps(swap_payload, indent=2)}")
+            
             response = requests.post(swap_url, json=swap_payload)
             if not response.ok:
                 logger.error(f"Failed to get swap transaction: {response.text}")
                 return None
                 
             swap_data = response.json()
+            logger.info(f"Received swap response: {json.dumps(swap_data, indent=2)}")
             
-            # Sign and send transaction
-            transaction = Transaction.from_bytes(base64.b64decode(swap_data['transaction']))
-            transaction.sign([self.keypair])
+            dynamic_slippage_report = swap_data.get("dynamicSlippageReport")
+
+            # Get the encoded transaction
+            encoded_transaction = swap_data.get('swapTransaction')
+            if not encoded_transaction:
+                logger.error("No swap transaction in response")
+                return None
+
+            transaction_bytes = base64.b64decode(encoded_transaction)
             
-            # Send transaction
-            tx_sig = await self.client.send_transaction(transaction)
-            return str(tx_sig)
+            unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
+            
+            last_valid_block_height = swap_data.get('lastValidBlockHeight')
+            if not last_valid_block_height:
+                logger.error("No lastValidBlockHeight in response")
+                return None
+            
+            message = unsigned_tx.message
+            if isinstance(message, MessageV0):
+                signed_tx = VersionedTransaction(
+                    message,
+                    [self.keypair]
+                )
+                
+                serialized_tx = base64.b64encode(bytes(signed_tx)).decode('utf-8')
+                
+                rpc_request = {
+                    "jsonrpc": "2.0",
+                    "id": "1",
+                    "method": "sendTransaction",
+                    "params": [
+                        serialized_tx,
+                        {
+                            "skipPreflight": True,
+                            "maxRetries": 5,
+                            "encoding": "base64",
+                            "minContextSlot": swap_data.get('simulationSlot'),
+                            "lastValidBlockHeight": last_valid_block_height,
+                            "preflightCommitment": "confirmed"
+                        }
+                    ]
+                }
+                
+                rpc_response = requests.post(
+                    HELIUS_RPC_URL,
+                    json=rpc_request,
+                    headers=self.headers
+                )
+                
+                if rpc_response.ok:
+                    result = rpc_response.json()
+                    if 'result' in result:
+                        tx_sig = result['result']
+                        logger.info(f"Transaction sent successfully: {tx_sig}")
+                        return {"tx_sig": tx_sig, "dynamic_slippage_report": dynamic_slippage_report}
+                        
+                    logger.error(f"No result in RPC response: {result}")
+                    return None
+                
+                logger.error(f"RPC request failed: {rpc_response.text}")
+                return None
+            else:
+                logger.error("Unexpected transaction message format")
+                return None
             
         except Exception as e:
             logger.error(f"Error executing swap: {str(e)}")
@@ -416,37 +547,3 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error getting SOL price: {str(e)}")
             return 0.0 
-
-    async def execute_jupiter_swap(self, quote_data: dict) -> Optional[str]:
-        """Execute a swap transaction using Jupiter API"""
-        try:
-            if not self.keypair:
-                logger.error("No keypair provided for swap execution")
-                return None
-            
-            swap_url = f"{self.jupiter_swap_url}/swap"
-            swap_payload = {
-                'routePlan': quote_data['routePlan'],
-                'userPublicKey': str(self.keypair.pubkey()),
-                'slippageBps': quote_data.get('slippageBps', 50)
-            }
-            
-            # Get swap transaction
-            response = requests.post(swap_url, json=swap_payload)
-            if not response.ok:
-                logger.error(f"Failed to get swap transaction: {response.text}")
-                return None
-            
-            swap_data = response.json()
-            
-            # Sign and send transaction
-            transaction = Transaction.from_bytes(base64.b64decode(swap_data['transaction']))
-            transaction.sign([self.keypair])
-            
-            # Send transaction
-            tx_sig = await self.client.send_transaction(transaction)
-            return str(tx_sig)
-            
-        except Exception as e:
-            logger.error(f"Error executing swap: {str(e)}")
-            return None

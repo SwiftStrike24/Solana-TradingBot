@@ -105,14 +105,48 @@ def format_swap_quote(quote: dict, token_info: dict = None, all_tokens_info: dic
     time_taken_ms = float(quote.get('timeTaken', 0)) * 1000  # Convert to milliseconds
     
     # Format output amount using correct decimals
+    input_amount = float(quote['inAmount']) / 1e9  # SOL is always 9 decimals
     output_amount = float(quote['outAmount']) / (10 ** token_decimals)
+
+    # Dynamic number formatting based on value
+    def format_token_amount(amount, token_symbol):
+        if token_symbol == "SOL":
+            if amount >= 1:
+                return f"{amount:.4f}"   # 1.2345 SOL
+            else:
+                return f"{amount:.4f}"   # 0.0059 SOL
+        else:
+            if amount >= 1000:
+                return f"{amount:,.2f}"  # 1,234.56
+            elif amount >= 1:
+                return f"{amount:.4f}"   # 12.3456
+            elif amount >= 0.000001:     # Show up to 9 decimals for small values
+                decimal_places = min(9, abs(len(str(amount).split('.')[-1])))
+                return f"{amount:.{decimal_places}f}"
+            else:
+                # For extremely small values (< 0.000001), use scientific notation
+                return f"{amount:.2e}"
+
+    # Format USD with full decimals for small values
+    def format_usd_value(value):
+        if value >= 0.01:
+            return f"{value:,.2f}"
+        elif value >= 0.000001:
+            decimal_places = min(9, abs(len(str(value).split('.')[-1])))
+            return f"{value:.{decimal_places}f}"
+        else:
+            return f"{value:.2e}"
+
+    formatted_input = format_token_amount(input_amount, "SOL")
+    formatted_output = format_token_amount(output_amount, token_symbol)
+    formatted_usd = format_usd_value(usd_value)
     
     quote_details = [
-        f"💰 [cyan]Input Amount:[/cyan] {float(quote['inAmount'])/1e9:.4f} SOL (${usd_value:.2f})",
-        f"💎 [cyan]Output Amount:[/cyan] {output_amount:.{token_decimals}} {token_symbol}",
+        f"💰 [cyan]Input Amount:[/cyan] {formatted_input} SOL (${formatted_usd})",
+        f"💎 [cyan]Output Amount:[/cyan] {formatted_output} {token_symbol}",
         f"🛡️ [yellow]Slippage:[/yellow] {quote['slippageBps']/100}%",
         f"📊 [magenta]Price Impact:[/magenta] {quote.get('priceImpactPct', '0')}%",
-        f"💵 [green]USD Value:[/green] ${usd_value:.2f}",
+        f"💵 [green]USD Value:[/green] ${formatted_usd}",
         f"⚡ [bright_yellow]Time:[/bright_yellow] {time_taken_ms:.2f}ms"
     ]
 
