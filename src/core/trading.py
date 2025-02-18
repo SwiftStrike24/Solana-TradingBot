@@ -3,21 +3,25 @@ from typing import Dict, Optional
 import requests
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey
-from src.config.settings import MAX_SLIPPAGE, MIN_LIQUIDITY_SOL
+from src.config.settings import MAX_SLIPPAGE, MIN_LIQUIDITY_SOL, HELIUS_RPC_URL
 from src.utils.helpers import get_solana_client, format_amount, calculate_price_impact
 import asyncio
 import json
+import base64
+from solders.transaction import Transaction
+from solders.keypair import Keypair
 
 logger = logging.getLogger(__name__)
 
 class TradingBot:
-    def __init__(self):
+    def __init__(self, keypair=None):
         self.client = get_solana_client()
         self.jupiter_swap_url = "https://api.jup.ag/swap/v1"  # Updated swap endpoint
         self.jupiter_price_url = "https://api.jup.ag/price/v2"  # New price endpoint
         self.jupiter_token_url = "https://api.jup.ag/tokens/v1"  # Already correct
         self.request_delay = 0.5  # 500ms delay between requests
         self.sol_mint = "So11111111111111111111111111111111111111112"
+        self.keypair = keypair
         self._token_cache = {}  # Cache for token info
     
     def _validate_address(self, address: str) -> Optional[str]:
@@ -203,12 +207,39 @@ class TradingBot:
             logger.error(f"Error getting swap quote:\n{str(e)}\n{'='*80}")
             return None
 
-    def execute_swap(self, quote: Dict) -> bool:
-        """Execute a swap transaction."""
-        # TODO: Implement actual swap execution using Jupiter Swap API
-        # This requires wallet integration and transaction signing
-        logger.info("Swap execution not yet implemented")
-        return False
+    async def execute_swap(self, quote: dict) -> Optional[str]:
+        """Execute a swap transaction using Jupiter API"""
+        try:
+            if not self.keypair:
+                logger.error("No keypair provided for swap execution")
+                return None
+                
+            swap_url = f"{self.jupiter_swap_url}/swap"
+            swap_payload = {
+                'routePlan': quote['routePlan'],
+                'userPublicKey': str(self.keypair.pubkey()),
+                'slippageBps': quote['slippageBps']
+            }
+            
+            # Get swap transaction
+            response = requests.post(swap_url, json=swap_payload)
+            if not response.ok:
+                logger.error(f"Failed to get swap transaction: {response.text}")
+                return None
+                
+            swap_data = response.json()
+            
+            # Sign and send transaction
+            transaction = Transaction.from_bytes(base64.b64decode(swap_data['transaction']))
+            transaction.sign([self.keypair])
+            
+            # Send transaction
+            tx_sig = await self.client.send_transaction(transaction)
+            return str(tx_sig)
+            
+        except Exception as e:
+            logger.error(f"Error executing swap: {str(e)}")
+            return None
 
     async def get_new_tokens(self, limit: int = 100, offset: int = 0) -> Optional[list]:
         """Get list of new tokens from Jupiter API."""
@@ -280,3 +311,142 @@ class TradingBot:
                 token_info[address] = {'symbol': '...', 'name': 'Unknown Token', 'decimals': 6}
         
         return token_info 
+
+    async def get_wallet_balance(self) -> float:
+        """Get SOL balance of the wallet using Helius RPC"""
+        try:
+            if not self.keypair:
+                return 0.0
+            
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAssetsByOwner",
+                "params": {
+                    "ownerAddress": str(self.keypair.pubkey()),
+                    "page": 1,
+                    "limit": 1000,
+                    "displayOptions": {
+                        "showNativeBalance": True,
+                        "showFungible": True
+                    }
+                }
+            }
+
+            response = requests.post(
+                HELIUS_RPC_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+
+            if response.ok:
+                data = response.json()
+                native_balance = data.get("result", {}).get("nativeBalance", {})
+                return float(native_balance.get("lamports", 0)) / 1e9
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error getting wallet balance: {str(e)}")
+            return 0.0
+
+    async def get_token_holdings(self) -> list:
+        """Get token holdings using Helius RPC"""
+        try:
+            if not self.keypair:
+                return []
+            
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getAssetsByOwner",
+                "params": {
+                    "ownerAddress": str(self.keypair.pubkey()),
+                    "page": 1,
+                    "limit": 1000,
+                    "displayOptions": {
+                        "showNativeBalance": True,
+                        "showFungible": True
+                    }
+                }
+            }
+
+            response = requests.post(
+                HELIUS_RPC_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+
+            holdings = []
+            if response.ok:
+                data = response.json()
+                items = data.get("result", {}).get("items", [])
+                
+                for item in items:
+                    # Only process FungibleToken items
+                    if item.get("interface") == "FungibleToken":
+                        token_info = item.get("token_info", {})
+                        if token_info:
+                            balance = float(token_info.get("balance", 0))
+                            decimals = int(token_info.get("decimals", 6))
+                            price_info = token_info.get("price_info", {})
+                            
+                            if balance > 0:  # Only include non-zero balances
+                                holdings.append({
+                                    "symbol": token_info.get("symbol", "Unknown"),
+                                    "amount": balance / (10 ** decimals),
+                                    "value_usd": float(price_info.get("total_price", 0))
+                                })
+            
+            return holdings
+            
+        except Exception as e:
+            logger.error(f"Error getting token holdings: {str(e)}")
+            return []
+
+    async def get_sol_price(self) -> float:
+        """Get current SOL price in USD"""
+        try:
+            url = f"{self.jupiter_price_url}/price"
+            params = {'id': 'So11111111111111111111111111111111111111112'}
+            response = requests.get(url, params=params)
+            if response.ok:
+                data = response.json()
+                return float(data['data']['price'])
+            return 0.0
+        except Exception as e:
+            logger.error(f"Error getting SOL price: {str(e)}")
+            return 0.0 
+
+    async def execute_jupiter_swap(self, quote_data: dict) -> Optional[str]:
+        """Execute a swap transaction using Jupiter API"""
+        try:
+            if not self.keypair:
+                logger.error("No keypair provided for swap execution")
+                return None
+            
+            swap_url = f"{self.jupiter_swap_url}/swap"
+            swap_payload = {
+                'routePlan': quote_data['routePlan'],
+                'userPublicKey': str(self.keypair.pubkey()),
+                'slippageBps': quote_data.get('slippageBps', 50)
+            }
+            
+            # Get swap transaction
+            response = requests.post(swap_url, json=swap_payload)
+            if not response.ok:
+                logger.error(f"Failed to get swap transaction: {response.text}")
+                return None
+            
+            swap_data = response.json()
+            
+            # Sign and send transaction
+            transaction = Transaction.from_bytes(base64.b64decode(swap_data['transaction']))
+            transaction.sign([self.keypair])
+            
+            # Send transaction
+            tx_sig = await self.client.send_transaction(transaction)
+            return str(tx_sig)
+            
+        except Exception as e:
+            logger.error(f"Error executing swap: {str(e)}")
+            return None
