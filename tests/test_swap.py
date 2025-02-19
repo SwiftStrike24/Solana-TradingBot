@@ -28,13 +28,14 @@ def format_wallet_info(balance: float, token_holdings: list, sol_price: float = 
     sol_value = balance * sol_price if sol_price else 0
     
     details = [
-        f"[cyan]SOL Balance:[/cyan] {balance:.4f} SOL (${sol_value:.2f})",
+        f"[cyan]SOL Balance:[/cyan] {balance:.4f} SOL" + (f" (${sol_value:.2f})" if sol_price > 0 else ""),
         "",
         "[yellow]Token Holdings:[/yellow]"
     ]
     
     for token in token_holdings:
-        details.append(f"• {token['symbol']}: {token['amount']} (${token['value_usd']:.2f})")
+        value_str = f" (${token['value_usd']:.2f})" if token['value_usd'] > 0 else ""
+        details.append(f"• {token['symbol']}: {token['amount']}{value_str}")
     
     return Panel(
         "\n".join(details),
@@ -61,18 +62,30 @@ async def interactive_swap_test():
         
         # Get SOL price and display it prominently
         sol_price = await coingecko.get_sol_price()
-        console.print(Panel(
-            f"✨ [bold magenta]1 SOL[/bold magenta] = [bold white]${sol_price:.2f}[/bold white] [dim]USD[/dim] ✨",
-            title="[bold purple]💫 SOLANA LIVE PRICE 💫[/bold purple]",
-            border_style="magenta",
-            padding=(1, 4),
-            style="purple"
-        ))
+        if sol_price is not None and sol_price > 0:
+            console.print(Panel(
+                f"✨ [bold magenta]1 SOL[/bold magenta] = [bold white]${sol_price:.2f}[/bold white] [dim]USD[/dim] ✨",
+                title="[bold purple]💫 SOLANA LIVE PRICE 💫[/bold purple]",
+                border_style="magenta",
+                padding=(1, 4),
+                style="purple"
+            ))
+        else:
+            console.print(Panel(
+                "⚠️ [yellow]Unable to fetch SOL price. Continuing without price display.[/yellow]",
+                title="[bold yellow]Price Warning[/bold yellow]",
+                border_style="yellow"
+            ))
+        
         # Get wallet info
         balance = await bot.get_wallet_balance()
         token_holdings = await bot.get_token_holdings()
         
-        console.print(format_wallet_info(balance, token_holdings, sol_price))
+        # Only format wallet info with price if we have a valid SOL price
+        if sol_price is not None and sol_price > 0:
+            console.print(format_wallet_info(balance, token_holdings, sol_price))
+        else:
+            console.print(format_wallet_info(balance, token_holdings, 0))
         
         while True:
             choice = console.input("\n[bold green]Choose action ([cyan]1[/cyan]: Test $1 Swap, [cyan]q[/cyan]: Quit):[/bold green] ").strip()
@@ -301,7 +314,8 @@ async def interactive_swap_test():
                                     f"[bold white]🔄 Swap Summary:[/bold white]\n"
                                     f"[cyan]FROM:[/cyan] {formatted_input} {input_token} 💫\n"
                                     f"[cyan]TO:[/cyan] {formatted_output} {output_token} ✨\n"
-                                    f"[dim white]Value:[/dim white] ${formatted_usd} USD\n\n"
+                                    f"[dim white]Value:[/dim white] ${formatted_usd} USD\n"
+                                    f"[dim white]Fee:[/dim white] ${total_fees_sol * sol_price:.4f} USD\n\n"
                                     f"[dim]Check Solscan for final confirmation status.[/dim]"
                                 )
                                 console.print(Panel(

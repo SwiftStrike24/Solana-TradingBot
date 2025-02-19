@@ -18,6 +18,8 @@ import base64
 from solders.transaction import Transaction
 from solders.keypair import Keypair
 import time
+from src.db.questdb import QuestDBClient, RPCMetrics
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ class TradingBot:
         self.sol_mint = "So11111111111111111111111111111111111111112"
         self.keypair = keypair
         self._token_cache = {}
+        self.questdb = QuestDBClient()
     
     def _validate_address(self, address: str) -> Optional[str]:
         """Validate and convert address to string format."""
@@ -419,6 +422,20 @@ class TradingBot:
                     logger.info(f"✅ Transaction sent successfully: {tx_sig}")
                     if jito_bundle_id:
                         logger.info(f"📦 Bundle ID: {jito_bundle_id}")
+                    # Record RPC metrics for successful transaction
+                    metrics = RPCMetrics(
+                        timestamp=datetime.utcnow(),
+                        rpc_type=rpc_type,
+                        latency_ms=latency,
+                        success=True,
+                        tx_signature=tx_sig,
+                        route_count=len(quote.get('routePlan', [])),
+                        slippage_bps=int(float(quote.get('slippageBps', 0))),
+                        compute_units=swap_data.get('computeUnitLimit'),
+                        priority_fee=PRIORITY_FEE_LAMPORTS,
+                        final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100))
+                    )
+                    self.questdb.record_rpc_metrics(metrics)
                     return {
                         "tx_sig": tx_sig,
                         "dynamic_slippage_report": dynamic_slippage_report,

@@ -26,4 +26,10 @@ WEBHOOK_HOST = "0.0.0.0"
 
 # Logging
 LOG_LEVEL = "INFO"
-LOG_FILE = "logs/trading_bot.log" 
+LOG_FILE = "logs/trading_bot.log"
+
+# QuestDB Settings
+QUESTDB_HOST = "localhost"
+QUESTDB_PORT = 8812
+QUESTDB_USER = "admin"
+QUESTDB_PASSWORD = "quest" 

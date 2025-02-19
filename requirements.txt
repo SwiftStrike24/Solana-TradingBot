@@ -8,3 +8,4 @@ aiohttp==3.11.12
 base58==2.1.1
 rich==13.9.4
 web3==6.15.1
+psycopg[binary,pool]>=3.2.4  # PostgreSQL driver for Python with binary and connection pooling
