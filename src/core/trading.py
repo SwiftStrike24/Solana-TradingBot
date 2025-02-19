@@ -422,7 +422,22 @@ class TradingBot:
                     logger.info(f"✅ Transaction sent successfully: {tx_sig}")
                     if jito_bundle_id:
                         logger.info(f"📦 Bundle ID: {jito_bundle_id}")
-                    # Record RPC metrics for successful transaction
+                    # Get actual fees from swap_data
+                    priority_fee_lamports = swap_data.get("prioritizationFeeLamports", PRIORITY_FEE_LAMPORTS)
+                    jito_tip_lamports = swap_data.get("jitoTipLamports", JITO_TIP_LAMPORTS)
+                    
+                    # Calculate total fees using actual values
+                    total_route_fees = sum(float(route['swapInfo']['feeAmount']) / (10 ** (
+                        9 if route['swapInfo']['feeMint'] in [
+                            "11111111111111111111111111111111",
+                            "So11111111111111111111111111111111111111112"
+                        ] else 6
+                    )) for route in quote['routePlan'])
+                    
+                    total_fees_sol = (total_route_fees + (priority_fee_lamports + jito_tip_lamports) / 1e9)
+                    sol_price = await self.get_sol_price()
+                    total_fee_usd = total_fees_sol * sol_price
+                    
                     metrics = RPCMetrics(
                         timestamp=datetime.utcnow(),
                         rpc_type=rpc_type,
@@ -432,8 +447,9 @@ class TradingBot:
                         route_count=len(quote.get('routePlan', [])),
                         slippage_bps=int(float(quote.get('slippageBps', 0))),
                         compute_units=swap_data.get('computeUnitLimit'),
-                        priority_fee=PRIORITY_FEE_LAMPORTS,
-                        final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100))
+                        priority_fee=priority_fee_lamports,  # Use actual priority fee
+                        final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100)),
+                        total_fee_usd=total_fee_usd
                     )
                     self.questdb.record_rpc_metrics(metrics)
                     return {
@@ -617,15 +633,42 @@ class TradingBot:
             return []
 
     async def get_sol_price(self) -> float:
-        """Get current SOL price in USD"""
+        """Get current SOL price in USD using Jupiter's price API with fallback to direct quote."""
         try:
+            # First attempt: Use Jupiter's price API
             url = f"{self.jupiter_price_url}/price"
-            params = {'id': 'So11111111111111111111111111111111111111112'}
+            params = {'ids': self.sol_mint}
             response = requests.get(url, params=params)
+            
             if response.ok:
                 data = response.json()
-                return float(data['data']['price'])
+                if 'data' in data and 'price' in data['data']:
+                    return float(data['data']['price'])
+            
+            # Second attempt: Calculate from a 1 SOL to USDC quote
+            usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            quote = await self._get_quote(
+                input_mint=self.sol_mint,
+                output_mint=usdc_mint,
+                amount=1_000_000_000  # 1 SOL in lamports
+            )
+            
+            if quote and 'outAmount' in quote:
+                return float(quote['outAmount']) / 1_000_000  # USDC has 6 decimals
+            
+            # Third attempt: Use CoinGecko as final fallback
+            response = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "solana", "vs_currencies": "usd"}
+            )
+            if response.ok:
+                data = response.json()
+                if 'solana' in data and 'usd' in data['solana']:
+                    return float(data['solana']['usd'])
+            
+            logger.warning("Failed to get SOL price from all sources")
             return 0.0
+            
         except Exception as e:
             logger.error(f"Error getting SOL price: {str(e)}")
             return 0.0 

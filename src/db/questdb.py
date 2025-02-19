@@ -18,6 +18,7 @@ class RPCMetrics:
     compute_units: Optional[int]
     priority_fee: Optional[int]
     final_slippage_bps: Optional[int]
+    total_fee_usd: Optional[float]  # Added field for total transaction fees in USD
 
 class QuestDBClient:
     def __init__(self):
@@ -37,7 +38,7 @@ class QuestDBClient:
         try:
             with psycopg.connect(**self.connection_params) as conn:
                 with conn.cursor() as cur:
-                    # Create RPC performance metrics table without dropping
+                    # Create RPC performance metrics table if it doesn't exist
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS rpc_metrics (
                             timestamp TIMESTAMP,
@@ -49,7 +50,8 @@ class QuestDBClient:
                             slippage_bps INT,
                             compute_units INT,
                             priority_fee INT,
-                            final_slippage_bps INT
+                            final_slippage_bps INT,
+                            total_fee_usd DOUBLE PRECISION
                         ) timestamp(timestamp) PARTITION BY DAY;
                     """)
                     conn.commit()
@@ -67,7 +69,7 @@ class QuestDBClient:
                         ) timestamp(timestamp) PARTITION BY DAY;
                     """)
                     conn.commit()
-                    logger.info("QuestDB tables verified successfully")
+                    logger.info("QuestDB tables initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing QuestDB tables: {str(e)}")
             raise
@@ -77,6 +79,12 @@ class QuestDBClient:
         try:
             with psycopg.connect(**self.connection_params) as conn:
                 with conn.cursor() as cur:
+                    # Debug logging
+                    logger.info(f"Recording metrics with total_fee_usd: {metrics.total_fee_usd} (type: {type(metrics.total_fee_usd)})")
+                    
+                    # Ensure total_fee_usd is a float with proper decimal precision
+                    total_fee_usd = float(metrics.total_fee_usd) if metrics.total_fee_usd is not None else 0.0
+                    
                     cur.execute("""
                         INSERT INTO rpc_metrics (
                             timestamp,
@@ -88,8 +96,9 @@ class QuestDBClient:
                             slippage_bps,
                             compute_units,
                             priority_fee,
-                            final_slippage_bps
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            final_slippage_bps,
+                            total_fee_usd
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::double precision)
                     """, (
                         metrics.timestamp,
                         metrics.rpc_type,
@@ -100,9 +109,11 @@ class QuestDBClient:
                         metrics.slippage_bps,
                         metrics.compute_units,
                         metrics.priority_fee,
-                        metrics.final_slippage_bps
+                        metrics.final_slippage_bps,
+                        total_fee_usd  # Explicitly converted to float above
                     ))
-                conn.commit()
+                    conn.commit()
+                    logger.info(f"Successfully recorded metrics with total_fee_usd: {total_fee_usd}")
         except Exception as e:
             logger.error(f"Error recording RPC metrics: {str(e)}")
 

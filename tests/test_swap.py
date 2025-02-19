@@ -130,10 +130,17 @@ async def interactive_swap_test():
                         console.print(format_swap_quote(quote, price_data.get('token_info'), all_tokens_info))
                         
                         # Calculate and display fee breakdown
-                        total_route_fees = sum(float(route['swapInfo']['feeAmount']) for route in quote['routePlan'])
-                        priority_fee_sol = PRIORITY_FEE_LAMPORTS / 1e9
-                        jito_tip_sol = JITO_TIP_LAMPORTS / 1e9
-                        total_fees_sol = (total_route_fees + PRIORITY_FEE_LAMPORTS + JITO_TIP_LAMPORTS) / 1e9
+                        total_route_fees = sum(float(route['swapInfo']['feeAmount']) / (10 ** (
+                            9 if route['swapInfo']['feeMint'] in [
+                                "11111111111111111111111111111111",
+                                "So11111111111111111111111111111111111111112"
+                            ] else 6
+                        )) for route in quote['routePlan'])
+                        
+                        # Use actual fees from quote if available, otherwise use defaults
+                        priority_fee_sol = quote.get('prioritizationFeeLamports', PRIORITY_FEE_LAMPORTS) / 1e9
+                        jito_tip_sol = quote.get('jitoTipLamports', JITO_TIP_LAMPORTS) / 1e9
+                        total_fees_sol = total_route_fees + priority_fee_sol + jito_tip_sol
                         
                         # Get current SOL price for USD conversion
                         sol_price = await coingecko.get_sol_price()
@@ -143,7 +150,7 @@ async def interactive_swap_test():
                             f"[cyan]Network Fees:[/cyan]\n"
                             f"├─ 🏃 Priority Fee: [green]{priority_fee_sol:.6f} SOL[/green] (${priority_fee_sol * sol_price:.4f})\n"
                             f"├─ ⚡ Jito MEV Tip: [green]{jito_tip_sol:.6f} SOL[/green] (${jito_tip_sol * sol_price:.4f})\n"
-                            f"└─ 🔄 Route Fees: [green]{total_route_fees/1e9:.6f} SOL[/green] (${total_route_fees/1e9 * sol_price:.4f})\n\n"
+                            f"└─ 🔄 Route Fees: [green]{total_route_fees:.6f} SOL[/green] (${total_route_fees * sol_price:.4f})\n\n"
                             f"[bold cyan]Route Details:[/bold cyan]"
                         )
                         
