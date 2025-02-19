@@ -7,13 +7,17 @@ from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
 from solders.signature import Signature
 from solana.rpc.commitment import Commitment
-from src.config.settings import MAX_SLIPPAGE, MIN_LIQUIDITY_SOL, HELIUS_RPC_URL, HELIUS_API_KEY
+from src.config.settings import (
+    MAX_SLIPPAGE, MIN_LIQUIDITY_SOL, HELIUS_RPC_URL, HELIUS_API_KEY,
+    JITO_RPC_URL, PRIORITY_FEE_LAMPORTS, JITO_TIP_LAMPORTS
+)
 from src.utils.helpers import get_solana_client, format_amount, calculate_price_impact
 import asyncio
 import json
 import base64
 from solders.transaction import Transaction
 from solders.keypair import Keypair
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +25,7 @@ class TradingBot:
     def __init__(self, keypair=None):
         # Initialize with proper RPC URL and headers
         self.client = Client(HELIUS_RPC_URL, commitment=Commitment("confirmed"))
+        self.jito_client = Client(JITO_RPC_URL, commitment=Commitment("confirmed"))
         self.headers = {
             "Content-Type": "application/json",
         }
@@ -287,10 +292,10 @@ class TradingBot:
                 "dynamicComputeUnitLimit": True,
                 # Auto-adjust slippage based on token metrics
                 "dynamicSlippage": True,
-                # Priority fee for network congestion
-                "prioritizationFeeLamports": 200_000,
-                # Jito MEV tip (requires Jito RPC)
-                "jitoTipLamports": 200_000
+                # Priority fee for network congestion (70% of total fee)
+                "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS,
+                # Jito MEV tip (30% of total fee)
+                "jitoTipLamports": JITO_TIP_LAMPORTS
             }
             
             logger.info(f"Sending swap request with payload: {json.dumps(swap_payload, indent=2)}")
@@ -336,9 +341,9 @@ class TradingBot:
                     "params": [
                         serialized_tx,
                         {
+                            "encoding": "base64",
                             "skipPreflight": True,
                             "maxRetries": 5,
-                            "encoding": "base64",
                             "minContextSlot": swap_data.get('simulationSlot'),
                             "lastValidBlockHeight": last_valid_block_height,
                             "preflightCommitment": "confirmed"
@@ -346,24 +351,84 @@ class TradingBot:
                     ]
                 }
                 
-                rpc_response = requests.post(
-                    HELIUS_RPC_URL,
-                    json=rpc_request,
-                    headers=self.headers
-                )
+                logger.info(f"Sending transaction concurrently to both RPCs")
                 
-                if rpc_response.ok:
-                    result = rpc_response.json()
-                    if 'result' in result:
-                        tx_sig = result['result']
-                        logger.info(f"Transaction sent successfully: {tx_sig}")
-                        return {"tx_sig": tx_sig, "dynamic_slippage_report": dynamic_slippage_report}
+                const_jito_url = f"{JITO_RPC_URL}/api/v1/transactions"
+                jito_headers = {
+                    "Content-Type": "application/json",
+                    "User-Agent": "jito-client",
+                    "X-API-Version": "1"
+                }
+                helius_url = HELIUS_RPC_URL
+                helius_headers = { "Content-Type": "application/json" }
+
+                async def send_transaction(url: str, headers: dict) -> Optional[tuple[requests.Response, str, float]]:
+                    try:
+                        start_time = time.perf_counter()
+                        loop = asyncio.get_running_loop()
+                        response = await loop.run_in_executor(
+                            None,
+                            lambda: requests.post(url, json=rpc_request, headers=headers)
+                        )
+                        end_time = time.perf_counter()
+                        latency = (end_time - start_time) * 1000  # Convert to milliseconds
                         
-                    logger.error(f"No result in RPC response: {result}")
+                        if response and response.ok and 'result' in response.json():
+                            rpc_type = "jito" if url.startswith(JITO_RPC_URL) else "helius"
+                            return response, rpc_type, latency
+                    except Exception as e:
+                        logger.error(f"Error sending transaction to {url}: {str(e)}")
                     return None
+
+                # Create tasks for both RPCs
+                jito_task = asyncio.create_task(send_transaction(const_jito_url, jito_headers))
+                helius_task = asyncio.create_task(send_transaction(helius_url, helius_headers))
                 
-                logger.error(f"RPC request failed: {rpc_response.text}")
-                return None
+                # Wait for first successful response
+                done, pending = await asyncio.wait(
+                    {jito_task, helius_task},
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                valid_response = None
+                rpc_type = None
+                latency = None
+
+                for task in done:
+                    try:
+                        result = await task
+                        if result:
+                            valid_response, rpc_type, latency = result
+                            break
+                    except Exception as e:
+                        logger.error(f"Task error: {str(e)}")
+
+                # Cancel pending tasks
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                
+                if valid_response:
+                    tx_sig = valid_response.json()["result"]
+                    request_url = valid_response.request.url if valid_response.request else ""
+                    jito_bundle_id = valid_response.headers.get("x-bundle-id") if request_url.startswith(JITO_RPC_URL) else None
+                    logger.info("🚀 Transaction Details:")
+                    logger.info(f"✅ Transaction sent successfully: {tx_sig}")
+                    if jito_bundle_id:
+                        logger.info(f"📦 Bundle ID: {jito_bundle_id}")
+                    return {
+                        "tx_sig": tx_sig,
+                        "dynamic_slippage_report": dynamic_slippage_report,
+                        "jito_bundle_id": jito_bundle_id,
+                        "rpc_used": rpc_type,
+                        "rpc_latency": latency
+                    }
+                else:
+                    logger.error("Both RPC requests failed to return a valid response.")
+                    return None
             else:
                 logger.error("Unexpected transaction message format")
                 return None

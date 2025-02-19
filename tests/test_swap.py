@@ -18,6 +18,7 @@ from src.core.trading import TradingBot
 from src.utils.helpers import setup_logging
 from tests.test_token import format_token_info, format_swap_quote
 from src.services.coingecko import CoinGeckoAPI
+from src.config.settings import PRIORITY_FEE_LAMPORTS, JITO_TIP_LAMPORTS
 
 console = Console()
 load_dotenv()
@@ -115,18 +116,111 @@ async def interactive_swap_test():
                         all_tokens_info = await bot.get_token_info_batch(list(token_addresses))
                         console.print(format_swap_quote(quote, price_data.get('token_info'), all_tokens_info))
                         
+                        # Calculate and display fee breakdown
+                        total_route_fees = sum(float(route['swapInfo']['feeAmount']) for route in quote['routePlan'])
+                        priority_fee_sol = PRIORITY_FEE_LAMPORTS / 1e9
+                        jito_tip_sol = JITO_TIP_LAMPORTS / 1e9
+                        total_fees_sol = (total_route_fees + PRIORITY_FEE_LAMPORTS + JITO_TIP_LAMPORTS) / 1e9
+                        
+                        # Get current SOL price for USD conversion
+                        sol_price = await coingecko.get_sol_price()
+                        
+                        fee_breakdown = (
+                            f"[bold white]💰 Transaction Fee Breakdown[/bold white]\n\n"
+                            f"[cyan]Network Fees:[/cyan]\n"
+                            f"├─ 🏃 Priority Fee: [green]{priority_fee_sol:.6f} SOL[/green] (${priority_fee_sol * sol_price:.4f})\n"
+                            f"├─ ⚡ Jito MEV Tip: [green]{jito_tip_sol:.6f} SOL[/green] (${jito_tip_sol * sol_price:.4f})\n"
+                            f"└─ 🔄 Route Fees: [green]{total_route_fees/1e9:.6f} SOL[/green] (${total_route_fees/1e9 * sol_price:.4f})\n\n"
+                            f"[bold cyan]Route Details:[/bold cyan]"
+                        )
+                        
+                        for idx, route in enumerate(quote['routePlan'], 1):
+                            swap = route['swapInfo']
+                            fee_amount = float(swap['feeAmount'])
+                            fee_token = all_tokens_info.get(swap['feeMint'], {'symbol': 'Unknown'})
+                            
+                            # Get correct decimals for fee token
+                            if swap['feeMint'] == "11111111111111111111111111111111" or \
+                               swap['feeMint'] == "So11111111111111111111111111111111111111112":
+                                fee_decimals = 9  # SOL decimals
+                            else:
+                                fee_decimals = fee_token.get('decimals', 6)
+                            
+                            # Calculate actual fee amount with correct decimals
+                            actual_fee = fee_amount / (10 ** fee_decimals)
+                            
+                            fee_breakdown += (
+                                f"\n{'└─' if idx == len(quote['routePlan']) else '├─'} [yellow]Step {idx}[/yellow] "
+                                f"via [blue]{swap['label']}[/blue]\n"
+                                f"   {'  ' if idx == len(quote['routePlan']) else '│ '} Fee: [green]{actual_fee:.6f}[/green] "
+                                f"{fee_token['symbol']}"
+                            )
+                        
+                        fee_breakdown += (
+                            f"\n\n[bold white]Total Cost:[/bold white]\n"
+                            f"[bold green]{total_fees_sol:.6f} SOL[/bold green] "
+                            f"([bold cyan]${total_fees_sol * sol_price:.4f}[/bold cyan])\n\n"
+                            f"[dim]• Priority Fee (70%) helps transaction land faster[/dim]\n"
+                            f"[dim]• Jito Tip (30%) provides MEV protection[/dim]\n"
+                            f"[dim]• Route fees are paid to liquidity providers[/dim]"
+                        )
+                        
+                        console.print(Panel(
+                            fee_breakdown,
+                            title="[bold yellow]🔥 Transaction Costs & Fees[/bold yellow]",
+                            border_style="yellow",
+                            padding=(1, 2),
+                            highlight=True
+                        ))
+
                         if console.input("\n[bold yellow]Execute swap? (y/n):[/bold yellow] ").lower() == 'y':
                             console.print("\n[bold cyan]Executing swap...[/bold cyan]")
                             tx_result = await bot.execute_swap(quote)
                             if tx_result:
                                 tx_sig = tx_result.get("tx_sig")
                                 dynamic_report = tx_result.get("dynamic_slippage_report")
+                                jito_bundle_id = tx_result.get("jito_bundle_id")
+                                rpc_used = tx_result.get("rpc_used", "Unknown")
+                                
+                                # Create RPC indicator based on which one was used
+                                rpc_indicator = (
+                                    "[bold yellow]⚡ JITO RPC[/bold yellow] (MEV Protected)" if rpc_used == "jito" else
+                                    "[bold cyan]🚀 HELIUS RPC[/bold cyan] (High Performance)" if rpc_used == "helius" else
+                                    "[bold red]❓ UNKNOWN RPC[/bold red]"
+                                )
+                                
+                                # Create transaction details panel with RPC info
+                                tx_details = [
+                                    "[green]Transaction sent successfully![/green]\n",
+                                    f"{rpc_indicator}",
+                                    f"[dim]Transaction routed through fastest available RPC[/dim]\n",
+                                    f"[white]Signature:[/white] {tx_sig}",
+                                    f"[white]View on Solscan:[/white] https://solscan.io/tx/{tx_sig}"
+                                ]
+                                
+                                # Add Jito-specific info if available
+                                if jito_bundle_id:
+                                    tx_details.extend([
+                                        "",
+                                        "[cyan]Jito MEV Protection Details:[/cyan]",
+                                        f"[white]Bundle ID:[/white] {jito_bundle_id}",
+                                        "[dim]Transaction bundled for frontrunning protection[/dim]"
+                                    ])
+                                
+                                # Add performance metrics if available
+                                if "rpc_latency" in tx_result:
+                                    latency = tx_result.get("rpc_latency")
+                                    tx_details.extend([
+                                        "",
+                                        "[magenta]Performance Metrics:[/magenta]",
+                                        f"[white]RPC Latency:[/white] {latency:.2f}ms"
+                                    ])
+                                
                                 console.print(Panel(
-                                    f"[green]Transaction sent successfully![/green]\n\n"
-                                    f"[white]Signature:[/white] {tx_sig}\n"
-                                    f"[white]View on Solscan:[/white] https://solscan.io/tx/{tx_sig}",
+                                    "\n".join(tx_details),
                                     title="[bold green]Transaction Details[/bold green]",
-                                    border_style="green"
+                                    border_style="green",
+                                    padding=(1, 2)
                                 ))
                                 if dynamic_report:
                                     final_slippage = float(dynamic_report.get("slippageBps", 0)) / 100.0
