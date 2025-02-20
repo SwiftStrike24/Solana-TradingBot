@@ -20,6 +20,7 @@ from solders.keypair import Keypair
 import time
 from src.db.questdb import QuestDBClient, RPCMetrics
 from datetime import datetime
+from src.services.coingecko import CoinGeckoAPI
 
 logger = logging.getLogger(__name__)
 
@@ -633,7 +634,7 @@ class TradingBot:
             return []
 
     async def get_sol_price(self) -> float:
-        """Get current SOL price in USD using Jupiter's price API with fallback to direct quote."""
+        """Get current SOL price in USD using Jupiter's price API with fallback to CoinGecko."""
         try:
             # First attempt: Use Jupiter's price API
             url = f"{self.jupiter_price_url}/price"
@@ -656,15 +657,11 @@ class TradingBot:
             if quote and 'outAmount' in quote:
                 return float(quote['outAmount']) / 1_000_000  # USDC has 6 decimals
             
-            # Third attempt: Use CoinGecko as final fallback
-            response = requests.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": "solana", "vs_currencies": "usd"}
-            )
-            if response.ok:
-                data = response.json()
-                if 'solana' in data and 'usd' in data['solana']:
-                    return float(data['solana']['usd'])
+            # Third attempt: Use CoinGecko service
+            coingecko = CoinGeckoAPI()
+            price = await coingecko.get_sol_price()
+            if price is not None:
+                return price
             
             logger.warning("Failed to get SOL price from all sources")
             return 0.0
