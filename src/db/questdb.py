@@ -3,6 +3,12 @@ from datetime import datetime
 import psycopg
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
+from src.config.settings import (
+    QUESTDB_HOST,
+    QUESTDB_PORT,
+    QUESTDB_USER,
+    QUESTDB_PASSWORD
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +33,11 @@ class QuestDBClient:
     def __init__(self):
         # QuestDB PostgreSQL wire protocol connection settings
         self.connection_params = {
-            "host": "localhost",
-            "port": 8812,
-            "user": "admin",
-            "password": "quest",
-            "dbname": "qdb"
+            "host": QUESTDB_HOST,
+            "port": QUESTDB_PORT,
+            "user": QUESTDB_USER,
+            "password": QUESTDB_PASSWORD,
+            "dbname": "qdb"  # This is fixed in QuestDB
         }
         
         self._init_tables()
