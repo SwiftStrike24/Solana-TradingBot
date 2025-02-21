@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
 import psycopg
+from psycopg import AsyncConnection
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from src.config.settings import (
@@ -9,6 +10,7 @@ from src.config.settings import (
     QUESTDB_USER,
     QUESTDB_PASSWORD
 )
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +42,21 @@ class QuestDBClient:
             "dbname": "qdb"  # This is fixed in QuestDB
         }
         
-        self._init_tables()
+        # Initialize tables asynchronously
+        asyncio.create_task(self._init_tables())
 
-    def _init_tables(self):
+    async def initialize(self):
+        """Async initialization method"""
+        await self._init_tables()
+        return self
+
+    async def _init_tables(self):
         """Initialize QuestDB tables for performance tracking if they don't exist."""
         try:
-            with psycopg.connect(**self.connection_params) as conn:
-                with conn.cursor() as cur:
+            async with await AsyncConnection.connect(**self.connection_params) as conn:
+                async with conn.cursor() as cur:
                     # Create RPC performance metrics table if it doesn't exist
-                    cur.execute("""
+                    await cur.execute("""
                         CREATE TABLE IF NOT EXISTS rpc_metrics (
                             timestamp TIMESTAMP,
                             rpc_type SYMBOL,
@@ -64,10 +72,10 @@ class QuestDBClient:
                             swap_usd_value DOUBLE
                         ) timestamp(timestamp) PARTITION BY DAY;
                     """)
-                    conn.commit()
+                    await conn.commit()
                     
                     # Create hourly summary table if it doesn't exist
-                    cur.execute("""
+                    await cur.execute("""
                         CREATE TABLE IF NOT EXISTS rpc_performance_hourly (
                             timestamp TIMESTAMP,
                             rpc_type SYMBOL,
@@ -79,19 +87,17 @@ class QuestDBClient:
                             avg_swap_value DOUBLE
                         ) timestamp(timestamp) PARTITION BY DAY;
                     """)
-                    conn.commit()
+                    await conn.commit()
                     logger.info("QuestDB tables initialized successfully")
         except Exception as e:
             logger.error(f"Error initializing QuestDB tables: {str(e)}")
             raise
 
-    def record_rpc_metrics(self, metrics: RPCMetrics):
+    async def record_rpc_metrics(self, metrics: RPCMetrics):
         """Record RPC performance metrics."""
         try:
-            with psycopg.connect(**self.connection_params) as conn:
-                with conn.cursor() as cur:
-                    # Debug logging
-                    logger.info(f"""
+            # Debug logging
+            logger.info(f"""
 {'='*80}
 🔄 Recording RPC Metrics:
 
@@ -111,12 +117,15 @@ class QuestDBClient:
    • Final: {metrics.final_slippage_bps/100 if metrics.final_slippage_bps else 'N/A'}%
 {'='*80}
 """)
-                    
-                    # Ensure values are float with proper decimal precision
-                    total_fee_usd = float(metrics.total_fee_usd) if metrics.total_fee_usd is not None else 0.0
-                    swap_usd_value = float(metrics.swap_usd_value) if metrics.swap_usd_value is not None else 0.0
-                    
-                    cur.execute("""
+            
+            # Ensure values are float with proper decimal precision
+            total_fee_usd = float(metrics.total_fee_usd) if metrics.total_fee_usd is not None else 0.0
+            swap_usd_value = float(metrics.swap_usd_value) if metrics.swap_usd_value is not None else 0.0
+            
+            # Use context manager to ensure proper connection handling
+            async with await AsyncConnection.connect(**self.connection_params) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
                         INSERT INTO rpc_metrics (
                             timestamp,
                             rpc_type,
@@ -145,7 +154,7 @@ class QuestDBClient:
                         total_fee_usd,
                         swap_usd_value
                     ))
-                    conn.commit()
+                    await conn.commit()
                     logger.info(f"""
 {'='*80}
 ✅ Metrics Successfully Recorded!
@@ -158,13 +167,15 @@ class QuestDBClient:
 """)
         except Exception as e:
             logger.error(f"Error recording RPC metrics: {str(e)}")
+            logger.error(f"Metrics data: {metrics.__dict__}")
+            raise
 
-    def get_rpc_performance_summary(self, hours: int = 24) -> Dict[str, Any]:
+    async def get_rpc_performance_summary(self, hours: int = 24) -> Dict[str, Any]:
         """Get RPC performance summary for the last N hours."""
         try:
-            with psycopg.connect(**self.connection_params) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
+            async with await AsyncConnection.connect(**self.connection_params) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
                         SELECT 
                             rpc_type,
                             avg(latency_ms) as avg_latency,
@@ -177,7 +188,7 @@ class QuestDBClient:
                         GROUP BY rpc_type
                     """, (hours,))
                     
-                    results = cur.fetchall()
+                    results = await cur.fetchall()
                     summary = {}
                     for row in results:
                         summary[row[0]] = {
@@ -192,12 +203,12 @@ class QuestDBClient:
             logger.error(f"Error getting RPC performance summary: {str(e)}")
             return {}
 
-    def get_latency_percentiles(self, rpc_type: str, hours: int = 24) -> Dict[str, float]:
+    async def get_latency_percentiles(self, rpc_type: str, hours: int = 24) -> Dict[str, float]:
         """Get latency percentiles for specific RPC."""
         try:
-            with psycopg.connect(**self.connection_params) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
+            async with await AsyncConnection.connect(**self.connection_params) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
                         SELECT 
                             percentile_disc(0.50) WITHIN GROUP (ORDER BY latency_ms) as p50,
                             percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms) as p95,
@@ -207,7 +218,7 @@ class QuestDBClient:
                         AND timestamp >= dateadd('h', -$2, now())
                     """, (rpc_type, hours))
                     
-                    row = cur.fetchone()
+                    row = await cur.fetchone()
                     if row:
                         return {
                             'p50': row[0],
@@ -219,16 +230,16 @@ class QuestDBClient:
             logger.error(f"Error getting latency percentiles: {str(e)}")
             return {}
 
-    def cleanup_old_data(self, days: int = 30):
+    async def cleanup_old_data(self, days: int = 30):
         """Clean up data older than specified days."""
         try:
-            with psycopg.connect(**self.connection_params) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
+            async with await AsyncConnection.connect(**self.connection_params) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
                         DELETE FROM rpc_metrics 
                         WHERE timestamp < dateadd('d', -$1, now())
                     """, (days,))
-                conn.commit()
+                await conn.commit()
                 logger.info(f"Cleaned up data older than {days} days")
         except Exception as e:
             logger.error(f"Error cleaning up old data: {str(e)}")
@@ -237,12 +248,12 @@ class QuestDBClient:
         """Convert UTC timestamp to 12-hour format"""
         return ts.strftime('%Y-%m-%d %I:%M:%S %p')
 
-    def get_formatted_metrics(self, hours: int = 24) -> list:
+    async def get_formatted_metrics(self, hours: int = 24) -> list:
         """Get metrics with formatted timestamps"""
         try:
-            with psycopg.connect(**self.connection_params) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
+            async with await AsyncConnection.connect(**self.connection_params) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("""
                         SELECT 
                             timestamp,
                             rpc_type,
@@ -259,7 +270,7 @@ class QuestDBClient:
                     """, (hours,))
                     
                     results = []
-                    for row in cur.fetchall():
+                    async for row in cur:
                         results.append({
                             'human_time': self._format_timestamp(row[0]),
                             'timestamp': row[0],

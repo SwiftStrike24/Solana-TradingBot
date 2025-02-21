@@ -17,8 +17,8 @@ JITO_RPC_URL = "https://slc.mainnet.block-engine.jito.wtf"
 MIN_LIQUIDITY_SOL = 1.0  # Minimum liquidity in SOL
 MAX_SLIPPAGE = 0.05  # Maximum slippage tolerance (5%)
 GAS_ADJUSTMENT = 1.5  # Gas price adjustment factor
-PRIORITY_FEE_LAMPORTS = 210_000  # 0.00021 SOL (70% of total fee)
-JITO_TIP_LAMPORTS = 90_000  # 0.00009 SOL (30% of total fee)
+PRIORITY_FEE_LAMPORTS = 7_000  # 0.000007 SOL (70% of total fee)
+JITO_TIP_LAMPORTS = 3_000  # 0.000003 SOL (30% of total fee)
 
 # Webhook Settings
 WEBHOOK_PORT = 8080

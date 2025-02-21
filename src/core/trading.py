@@ -75,7 +75,18 @@ class TradingBot:
         # Optimize session management
         self._session_pool = {}
         self._session_semaphore = asyncio.Semaphore(100)  # Limit concurrent connections
+        
+        # Initialize QuestDB client asynchronously
+        asyncio.create_task(self._init_questdb())
     
+    async def _init_questdb(self):
+        """Initialize QuestDB client"""
+        try:
+            self.questdb = await QuestDBClient().initialize()
+        except Exception as e:
+            logger.error(f"Failed to initialize QuestDB client: {str(e)}")
+            self.questdb = None
+
     async def _get_session(self, endpoint: str) -> aiohttp.ClientSession:
         """Get or create optimized aiohttp session with connection pooling"""
         if endpoint not in self._session_pool or self._session_pool[endpoint].closed:
@@ -595,9 +606,16 @@ class TradingBot:
                                     retry_count=attempt,
                                     slippage_adjustment=adjusted_slippage
                                 )
+                                
+                                # Ensure QuestDB client is initialized
+                                if not hasattr(self, 'questdb') or self.questdb is None:
+                                    self.questdb = QuestDBClient()
+                                    
+                                # Record metrics synchronously to avoid NoneType error
                                 await self.questdb.record_rpc_metrics(metrics)
                             except Exception as e:
-                                logger.error(f"Failed to record success metrics: {str(e)}")
+                                logger.error(f"Failed to record metrics: {str(e)}")
+                                logger.error(f"Metrics data: {metrics.__dict__}")
                             
                             return {
                                 "success": True,
