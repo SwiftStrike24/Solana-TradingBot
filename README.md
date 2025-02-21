@@ -1,71 +1,67 @@
 # 🚀 Solana Advanced Trading Bot
 
-A high-performance Solana trading bot leveraging Helius & Jito RPC for MEV protection, with Jupiter API integration for optimal swap routing and QuestDB analytics.
+A high-performance Solana trading bot with advanced MEV protection, multi-RPC failover, and comprehensive analytics. Built for memecoin trading with robust safety features and real-time performance monitoring.
 
-## ✨ Features
+## ✨ Core Features
 
-- **Multi-Source Price Oracle**
-  - Jupiter Price API (primary)
-  - USDC Quote Calculation (secondary)
-  - CoinGecko API Integration (fallback)
-  - Price caching for optimization
-  - Real-time USD value conversion
-
-- **Dual RPC Support**
-  - Helius RPC for high performance
-  - Jito RPC for MEV protection
-  - Automatic RPC failover
-  - Performance tracking & analytics
+### 🔄 Trading Engine
+- **Multi-RPC Architecture**
+  - Primary: Helius RPC (High Performance)
+  - Secondary: Jito RPC (MEV Protection)
+  - Automatic failover with latency-based routing
+  - Parallel RPC request execution
+  - Dynamic compute unit adjustment
 
 - **Advanced Swap Features**
-  - Dynamic slippage adjustment
-  - Multi-route optimization
-  - Price impact analysis
-  - Liquidity verification
-  - Gas optimization
-  - Token validation & verification
+  - Dynamic slippage calculation based on token category
+  - Multi-route optimization with parallel execution
+  - Real-time price impact analysis
+  - Automatic gas fee optimization
+  - MEV protection via Jito bundles
+  - Transaction simulation & validation
 
-- **QuestDB Analytics Integration**
-  - Transaction metrics storage
+### 📊 Analytics & Monitoring
+
+- **QuestDB Integration**
+  - Real-time transaction metrics
   - RPC performance tracking
   - Success rate monitoring
   - Latency analysis
   - Fee analytics
+  - Token metrics storage
 
-- **Real-time Analytics**
-  - Token price tracking
-  - Wallet balance monitoring
-  - Transaction cost analysis
-  - Performance metrics
-  - Rich console output
-  - Dynamic fee calculations
+- **Performance Metrics**
+  - RPC latency tracking (min/max/avg)
+  - Success rate monitoring
+  - Compute unit optimization
+  - Gas fee analysis
+  - Route efficiency tracking
 
-- **MEV Protection**
-  - Jito bundles support
-  - Priority fees optimization
-  - Transaction protection
-  - Frontrunning prevention
-  - Bundle ID tracking
+### 🛡️ Safety Features
 
-## 🛠 Setup
+- **Transaction Protection**
+  - Priority Fee: 0.000007 SOL (70%) - [Configure in settings.py](src/config/settings.py)
+  - Jito MEV Tip: 0.000003 SOL (30%) - [Configure in settings.py](src/config/settings.py)
+  - Dynamic slippage adjustment
+  - Frontrunning protection
+  - Transaction bundling
+  - Automatic retry mechanism
 
-1. Create virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # Windows: .\venv\Scripts\activate
-```
+- **Token Validation**
+  - Liquidity verification
+  - Market cap analysis
+  - Price impact checks
+  - Token contract verification
+  - Trading volume analysis
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+### 💹 Price Oracle System
 
-3. Configure `.env`:
-```env
-HELIUS_API_KEY=your_helius_api_key
-SOLANA_WALLET_PRIVATE_KEY=your_wallet_private_key
-COINGECKO_API_KEY=your_coingecko_api_key  # Optional
-```
+- **Multi-Source Price Feed**
+  - Jupiter Price API (Primary)
+  - USDC Quote Calculation (Secondary)
+  - CoinGecko API (Fallback)
+  - Real-time price updates
+  - Price deviation checks
 
 ## 📁 Project Structure
 
@@ -86,92 +82,142 @@ COINGECKO_API_KEY=your_coingecko_api_key  # Optional
 └── requirements.txt    # Dependencies
 ```
 
-## 💫 Usage
+## 🛠 Setup
 
-### Interactive Testing
+1. **Environment Setup**
+```bash
+python -m venv venv
+source venv/bin/activate  # Windows: .\venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+2. **Configuration**
+```env
+HELIUS_API_KEY=your_helius_api_key
+SOLANA_WALLET_PRIVATE_KEY=your_wallet_private_key
+COINGECKO_API_KEY=your_coingecko_api_key  # Optional
+```
+
+3. **QuestDB Setup**
+```env
+QUESTDB_HOST=localhost
+QUESTDB_PORT=8812
+QUESTDB_USER=admin
+QUESTDB_PASSWORD=quest
+```
+
+## 📊 Interactive Testing
+
 ```bash
 python tests/test_swap.py
 ```
 
-### Production Bot
-```bash
-python src/main.py
-```
+Features:
+- Single swap testing ($1 trades)
+- Batch testing (5x $1 swaps)
+- Real-time performance metrics
+- Detailed fee breakdown
+- Token analysis
+- Wallet monitoring
 
-## ⚡ Performance Features
+## 🔍 Monitoring Features
 
-- Concurrent RPC requests for minimal latency
-- Dynamic compute unit adjustment
-- Optimized priority fees
-- MEV protection via Jito bundles
-- Performance analytics & tracking
-- Price caching system
-- Efficient token info caching
+- **Rich Console Output**
+  - Live wallet status with USD values
+  - Token verification status
+  - Detailed swap quotes
+  - Fee breakdowns (SOL & USD)
+  - Transaction status tracking
+  - RPC performance metrics
+  - Slippage analysis
 
-## 🔒 Security Features
+- **Transaction Analytics**
+  - Route optimization details
+  - MEV protection status
+  - Gas optimization metrics
+  - Price impact analysis
+  - Liquidity depth indicators
+  - Token market metrics
 
-- Dynamic slippage protection
-- Liquidity verification
-- Token validation & verification
-- MEV protection
-- Transaction simulation
-- Multiple price sources
-- Error handling & logging
+## 🚀 Performance Optimizations
 
-## 📊 Analytics
+- **RPC Optimization**
+  - Parallel request execution
+  - Connection pooling
+  - DNS caching
+  - Automatic retry logic
+  - Dynamic timeout adjustment
+  - Load balancing
 
-- QuestDB metrics integration
-- RPC performance tracking
-- Transaction cost analysis
-- Token price monitoring
-- Wallet balance tracking
-- Success rate metrics
-- Latency measurements
+- **Transaction Processing**
+  - Async/await architecture
+  - Thread pool for CPU tasks
+  - Optimized memory usage
+  - Efficient error handling
+  - Resource cleanup
 
-## 🛡 Transaction Protection
+## 📈 Advanced Features
 
-- Priority fees: 0.00021 SOL (70%)
-- Jito MEV tip: 0.00009 SOL (30%)
-- Dynamic slippage adjustment
-- Route optimization
-- Frontrunning protection
-- Transaction bundling
+- **Batch Testing**
+  - Multiple swap execution
+  - Performance aggregation
+  - Success rate tracking
+  - RPC distribution analysis
+  - Cost analysis
+  - Token metrics
 
-## 📈 Monitoring
+- **Dynamic Adjustments**
+  - Slippage calculation
+  - Gas fee optimization
+  - Route selection
+  - RPC failover
+  - Error recovery
+  - Performance tuning
 
-Rich console output includes:
-- Wallet status with USD values
-- Token information & verification
-- Detailed swap quotes
-- Fee breakdowns in SOL & USD
-- Transaction status & confirmations
-- Performance metrics
-- Dynamic slippage analysis
-- MEV protection details
-
-## 🔧 Advanced Features
-
-- Token price impact analysis
-- Multi-source price fetching
-- Automatic fee optimization
-- Dynamic route selection
-- Comprehensive error handling
-- Detailed logging system
-- Transaction simulation
-- Token validation checks
-
-## Requirements
+## 🔧 System Requirements
 
 - Python 3.8+
+- QuestDB instance
 - Solana wallet
 - Helius API key
-- QuestDB instance
-- CoinGecko API key (optional)
+- Windows/Linux/MacOS support
+- 2GB RAM minimum
 
-## 📝 Notes
+## 🛡️ Safety Notes
 
-- Supports both mainnet and devnet
-- Includes comprehensive error handling
-- Features detailed logging system
-- Optimized for memecoin trading
-- Built-in protection mechanisms 
+- Built-in slippage protection
+- MEV protection via Jito
+- Multiple price sources
+- Transaction simulation
+- Token validation
+- Error recovery
+- Resource cleanup
+
+## 📝 Latest Updates
+
+- Windows event loop compatibility
+- Enhanced error handling
+- Improved QuestDB integration
+- Better RPC failover
+- Optimized batch testing
+- Advanced metrics tracking
+- Rich console output
+- Transaction protection
+
+## 🔗 Dependencies
+
+Core dependencies:
+- `solders`: Solana transaction handling
+- `psycopg`: QuestDB async connection
+- `aiohttp`: Async HTTP client
+- `rich`: Console output formatting
+- `numba`: Performance optimization
+- `asyncio`: Async operations
+
+## 📚 Documentation
+
+For detailed documentation on each component:
+- [Trading Engine](src/core/trading.py)
+- [QuestDB Integration](src/db/questdb.py)
+- [Test Suite](tests/test_swap.py)
+- [Configuration](src/config/settings.py) 
