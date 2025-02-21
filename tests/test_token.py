@@ -35,6 +35,7 @@ def format_token_info(token_address: str, price_data: dict, liquidity: dict) -> 
     verified = token_info.get('verified', False)
     daily_volume = token_info.get('daily_volume')
     created_at = token_info.get('created_at', 'Unknown')
+    market_cap = token_info.get('market_cap')
     
     # Format creation date if available
     if created_at and created_at != 'Unknown':
@@ -70,10 +71,14 @@ def format_token_info(token_address: str, price_data: dict, liquidity: dict) -> 
     # Format daily volume with fallback
     volume_display = f"{daily_volume:,.2f} USD" if daily_volume is not None else "No data"
     
+    # Format market cap with fallback
+    market_cap_display = f"${market_cap:,.2f}" if market_cap is not None else "No data"
+    
     details = [
         f"[cyan]Token:[/cyan] {name} ({symbol}) {verification_status}",
         f"[cyan]Address:[/cyan] {token_address}",
         f"[yellow]Created:[/yellow] {created_at}",
+        f"[magenta]Market Cap:[/magenta] {market_cap_display}",
         f"[magenta]Daily Volume:[/magenta] {volume_display}",
         "",
         f"[green]1 SOL = {tokens_per_sol:.{token_precision}f} {symbol}[/green]",

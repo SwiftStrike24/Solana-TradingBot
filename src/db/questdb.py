@@ -18,7 +18,8 @@ class RPCMetrics:
     compute_units: Optional[int]
     priority_fee: Optional[int]
     final_slippage_bps: Optional[int]
-    total_fee_usd: Optional[float]  # Added field for total transaction fees in USD
+    total_fee_usd: Optional[float]  # Total transaction fees in USD
+    swap_usd_value: Optional[float]  # Value of the swap in USD
     retry_count: int = 0
     slippage_adjustment: float = 0.0
 
@@ -53,7 +54,8 @@ class QuestDBClient:
                             compute_units INT,
                             priority_fee INT,
                             final_slippage_bps INT,
-                            total_fee_usd DOUBLE PRECISION
+                            total_fee_usd DOUBLE,
+                            swap_usd_value DOUBLE
                         ) timestamp(timestamp) PARTITION BY DAY;
                     """)
                     conn.commit()
@@ -67,7 +69,8 @@ class QuestDBClient:
                             success_rate DOUBLE,
                             total_txs LONG,
                             avg_compute_units DOUBLE,
-                            avg_priority_fee DOUBLE
+                            avg_priority_fee DOUBLE,
+                            avg_swap_value DOUBLE
                         ) timestamp(timestamp) PARTITION BY DAY;
                     """)
                     conn.commit()
@@ -82,10 +85,30 @@ class QuestDBClient:
             with psycopg.connect(**self.connection_params) as conn:
                 with conn.cursor() as cur:
                     # Debug logging
-                    logger.info(f"Recording metrics with total_fee_usd: {metrics.total_fee_usd} (type: {type(metrics.total_fee_usd)})")
+                    logger.info(f"""
+{'='*80}
+🔄 Recording RPC Metrics:
+
+💰 Transaction Details:
+   • Fee (USD): ${metrics.total_fee_usd:.4f} ({type(metrics.total_fee_usd)})
+   • Swap Value: ${metrics.swap_usd_value:.2f} ({type(metrics.swap_usd_value)})
+   • RPC: {metrics.rpc_type.upper()}
+   • Routes: {metrics.route_count}
+
+⚡ Performance:
+   • Latency: {metrics.latency_ms:.2f}ms
+   • Compute Units: {metrics.compute_units or 'N/A'}
+   • Priority Fee: {metrics.priority_fee/1e9:.6f} SOL
+
+🎯 Slippage:
+   • Initial: {metrics.slippage_bps/100 if metrics.slippage_bps else 'N/A'}%
+   • Final: {metrics.final_slippage_bps/100 if metrics.final_slippage_bps else 'N/A'}%
+{'='*80}
+""")
                     
-                    # Ensure total_fee_usd is a float with proper decimal precision
+                    # Ensure values are float with proper decimal precision
                     total_fee_usd = float(metrics.total_fee_usd) if metrics.total_fee_usd is not None else 0.0
+                    swap_usd_value = float(metrics.swap_usd_value) if metrics.swap_usd_value is not None else 0.0
                     
                     cur.execute("""
                         INSERT INTO rpc_metrics (
@@ -99,8 +122,9 @@ class QuestDBClient:
                             compute_units,
                             priority_fee,
                             final_slippage_bps,
-                            total_fee_usd
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::double precision)
+                            total_fee_usd,
+                            swap_usd_value
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::double precision, %s::double precision)
                     """, (
                         metrics.timestamp,
                         metrics.rpc_type,
@@ -112,10 +136,20 @@ class QuestDBClient:
                         metrics.compute_units,
                         metrics.priority_fee,
                         metrics.final_slippage_bps,
-                        total_fee_usd  # Explicitly converted to float above
+                        total_fee_usd,
+                        swap_usd_value
                     ))
                     conn.commit()
-                    logger.info(f"Successfully recorded metrics with total_fee_usd: {total_fee_usd}")
+                    logger.info(f"""
+{'='*80}
+✅ Metrics Successfully Recorded!
+
+📊 Summary:
+   • Fee: ${total_fee_usd:.4f}
+   • Value: ${swap_usd_value:.2f}
+   • Signature: {metrics.tx_signature[:8]}...{metrics.tx_signature[-8:] if metrics.tx_signature else 'N/A'}
+{'='*80}
+""")
         except Exception as e:
             logger.error(f"Error recording RPC metrics: {str(e)}")
 

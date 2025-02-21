@@ -58,14 +58,30 @@ class TradingBot:
             validated_address = self._validate_address(token_address)
             if not validated_address:
                 return None
-                
+            
+            # Handle special addresses
+            if validated_address in ["11111111111111111111111111111111", "So11111111111111111111111111111111111111112"]:
+                return {
+                    'symbol': 'SOL',
+                    'name': 'Solana',
+                    'decimals': 9,
+                    'tags': ['native'],
+                    'daily_volume': None,  # Could fetch from another source if needed
+                    'logo_uri': 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png',
+                    'verified': True,
+                    'created_at': None,
+                    'mint_authority': None,
+                    'freeze_authority': None,
+                    'permanent_delegate': None
+                }
+
             url = f"{self.jupiter_token_url}/token/{validated_address}"
             logger.info(f"\n{'='*80}\nFetching token info for: {validated_address}\nURL: {url}\n{'='*80}")
             
             response = requests.get(url)
             
             if not response.ok:
-                logger.error(f"Failed to get token info: Status {response.status_code}\nResponse: {response.text}")
+                logger.warning(f"Failed to get token info: Status {response.status_code}\nResponse: {response.text}")
                 return None
                 
             token_info = response.json()
@@ -99,6 +115,11 @@ class TradingBot:
             # Get token info first
             token_info = await self.get_token_info(validated_address)
             decimals = token_info['decimals'] if token_info else 6
+            
+            # Get market cap from Helius
+            market_cap = await self.get_token_market_cap(validated_address)
+            if market_cap is not None:
+                token_info['market_cap'] = market_cap
             
             # Get price for 1 SOL worth of tokens
             sol_quote = await self._get_quote(
@@ -308,17 +329,50 @@ class TradingBot:
                 
                 swap_data = response.json()
                 logger.info(f"Received swap response: {json.dumps(swap_data, indent=2)}")
-                
-                dynamic_slippage_report = swap_data.get("dynamicSlippageReport")
 
-                # Get the encoded transaction
+                # Check for simulation errors before proceeding
+                simulation_error = swap_data.get("simulationError")
+                if simulation_error:
+                    error_code = simulation_error.get("errorCode")
+                    error_msg = simulation_error.get("error")
+                    logger.error(f"Simulation failed on attempt {attempt+1}: {error_code} - {error_msg}")
+                    
+                    # Record failed attempt in QuestDB
+                    metrics = RPCMetrics(
+                        timestamp=datetime.utcnow(),
+                        rpc_type="simulation",
+                        latency_ms=0,
+                        success=False,
+                        tx_signature=None,
+                        route_count=len(quote.get('routePlan', [])),
+                        slippage_bps=int(adjusted_slippage * 10000),
+                        compute_units=swap_data.get('computeUnitLimit'),
+                        priority_fee=swap_payload['prioritizationFeeLamports'],
+                        final_slippage_bps=None,
+                        total_fee_usd=0,
+                        swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
+                        retry_count=attempt,
+                        slippage_adjustment=adjusted_slippage
+                    )
+                    self.questdb.record_rpc_metrics(metrics)
+                    
+                    # If this is the last attempt, return failure details
+                    if attempt == max_retries - 1:
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "error_code": error_code,
+                            "retries": attempt + 1
+                        }
+                    continue
+
+                dynamic_slippage_report = swap_data.get("dynamicSlippageReport")
                 encoded_transaction = swap_data.get('swapTransaction')
                 if not encoded_transaction:
                     logger.error("No swap transaction in response")
                     continue
 
                 transaction_bytes = base64.b64decode(encoded_transaction)
-                
                 unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
                 
                 last_valid_block_height = swap_data.get('lastValidBlockHeight')
@@ -422,6 +476,19 @@ class TradingBot:
                             logger.info(f"📦 Bundle ID: {jito_bundle_id}")
 
                         try:
+                            # Wait for transaction confirmation before calculating fees
+                            confirmation_result = await self.wait_for_confirmation(Signature.from_string(tx_sig))
+                            if not confirmation_result:
+                                logger.error("Transaction failed to confirm")
+                                if attempt < max_retries - 1:
+                                    continue
+                                return {
+                                    "success": False,
+                                    "error": "Transaction failed to confirm",
+                                    "tx_sig": tx_sig,
+                                    "retries": attempt + 1
+                                }
+
                             # Get actual fees from swap_data with fallbacks
                             priority_fee_lamports = swap_data.get("prioritizationFeeLamports", PRIORITY_FEE_LAMPORTS)
                             jito_tip_lamports = swap_data.get("jitoTipLamports", JITO_TIP_LAMPORTS)
@@ -432,11 +499,30 @@ class TradingBot:
                                 try:
                                     fee_amount = float(route['swapInfo']['feeAmount'])
                                     fee_mint = route['swapInfo']['feeMint']
-                                    decimals = 9 if fee_mint in [
-                                        "11111111111111111111111111111111",
-                                        "So11111111111111111111111111111111111111112"
-                                    ] else 6
-                                    total_route_fees += fee_amount / (10 ** decimals)
+                                    
+                                    # Skip system program fees (all zeros)
+                                    if fee_mint == "11111111111111111111111111111111":
+                                        continue
+                                        
+                                    # For SOL fees
+                                    if fee_mint == "So11111111111111111111111111111111111111112":
+                                        total_route_fees += fee_amount / 1e9
+                                        continue
+                                        
+                                    # For non-SOL fees, we need to get their SOL equivalent
+                                    try:
+                                        # Get quote to convert fee token to SOL
+                                        reverse_quote = await self._get_quote(
+                                            input_mint=fee_mint,
+                                            output_mint="So11111111111111111111111111111111111111112",
+                                            amount=int(fee_amount)  # Use original amount in base units
+                                        )
+                                        if reverse_quote and 'outAmount' in reverse_quote:
+                                            fee_in_sol = float(reverse_quote['outAmount']) / 1e9
+                                            total_route_fees += fee_in_sol
+                                    except Exception as e:
+                                        logger.warning(f"Failed to convert fee to SOL: {e}")
+                                        
                                 except (KeyError, ValueError, TypeError) as e:
                                     logger.warning(f"Error calculating route fee: {e}")
                                     continue
@@ -461,6 +547,15 @@ class TradingBot:
                             # Calculate total fee in USD with safety check
                             total_fee_usd = total_fees_sol * sol_price if sol_price > 0 else 0
 
+                            # Log the fee calculation for debugging
+                            logger.info(f"Fee Calculation Details:")
+                            logger.info(f"- Total Route Fees (SOL): {total_route_fees}")
+                            logger.info(f"- Priority Fee (SOL): {priority_fee_lamports/1e9}")
+                            logger.info(f"- Jito Tip (SOL): {jito_tip_lamports/1e9}")
+                            logger.info(f"- Total Fees (SOL): {total_fees_sol}")
+                            logger.info(f"- SOL Price: ${sol_price}")
+                            logger.info(f"- Total Fees (USD): ${total_fee_usd}")
+
                             # Create metrics object with safe values
                             metrics = RPCMetrics(
                                 timestamp=datetime.utcnow(),
@@ -473,15 +568,16 @@ class TradingBot:
                                 compute_units=swap_data.get('computeUnitLimit'),
                                 priority_fee=priority_fee_lamports,
                                 final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100)),
-                                total_fee_usd=total_fee_usd
+                                total_fee_usd=total_fee_usd,
+                                swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
+                                retry_count=attempt,
+                                slippage_adjustment=adjusted_slippage
                             )
 
-                            # Add retry metadata to metrics
-                            metrics.retry_count = attempt
-                            metrics.slippage_adjustment = adjusted_slippage
                             self.questdb.record_rpc_metrics(metrics)
                             
                             return {
+                                "success": True,
                                 "tx_sig": tx_sig,
                                 "retries": attempt,
                                 "adjusted_slippage": adjusted_slippage,
@@ -494,13 +590,32 @@ class TradingBot:
 
                         except Exception as e:
                             logger.error(f"Error processing fees and metrics: {e}")
-                            # Return basic success response if fee calculation fails
+                            # Record failed attempt in QuestDB
+                            metrics = RPCMetrics(
+                                timestamp=datetime.utcnow(),
+                                rpc_type=rpc_type or "unknown",
+                                latency_ms=latency or 0,
+                                success=False,
+                                tx_signature=tx_sig,
+                                route_count=len(quote.get('routePlan', [])),
+                                slippage_bps=int(adjusted_slippage * 10000),
+                                compute_units=swap_data.get('computeUnitLimit'),
+                                priority_fee=priority_fee_lamports,
+                                final_slippage_bps=None,
+                                total_fee_usd=0,
+                                swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
+                                retry_count=attempt,
+                                slippage_adjustment=adjusted_slippage
+                            )
+                            self.questdb.record_rpc_metrics(metrics)
+                            
+                            if attempt < max_retries - 1:
+                                continue
                             return {
+                                "success": False,
+                                "error": str(e),
                                 "tx_sig": tx_sig,
-                                "retries": attempt,
-                                "adjusted_slippage": adjusted_slippage,
-                                "rpc_used": rpc_type,
-                                "rpc_latency": latency
+                                "retries": attempt + 1
                             }
 
                 else:
@@ -514,7 +629,11 @@ class TradingBot:
                     await asyncio.sleep(retry_delay * (attempt + 1))
                     
         logger.error(f"Transaction failed after {max_retries} attempts")
-        return None
+        return {
+            "success": False,
+            "error": "Max retries exceeded",
+            "retries": max_retries
+        }
 
     async def _get_updated_quote(self, original_quote: dict, slippage: float) -> Optional[dict]:
         """Refresh quote with updated parameters."""
@@ -727,3 +846,53 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error getting SOL price: {str(e)}")
             return 0.0 
+
+    async def get_token_market_cap(self, token_address: str) -> Optional[float]:
+        """Get token market cap from Helius API."""
+        try:
+            validated_address = self._validate_address(token_address)
+            if not validated_address:
+                return None
+
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "jup-token-info",
+                "method": "getAsset",
+                "params": {
+                    "id": validated_address,
+                    "displayOptions": {
+                        "showFungible": True
+                    }
+                }
+            }
+
+            response = requests.post(
+                HELIUS_RPC_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+
+            if response.ok:
+                data = response.json()
+                result = data.get("result", {})
+                token_info = result.get("token_info", {})
+                
+                # Get total supply and price info
+                total_supply = token_info.get("supply")
+                price_info = token_info.get("price_info", {})
+                price_per_token = price_info.get("price_per_token")
+                
+                if total_supply is not None and price_per_token is not None:
+                    # Convert supply from base units to actual tokens using decimals
+                    decimals = token_info.get("decimals", 6)
+                    actual_supply = float(total_supply) / (10 ** decimals)
+                    
+                    # Calculate market cap
+                    market_cap = actual_supply * float(price_per_token)
+                    return market_cap
+                    
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting token market cap: {str(e)}")
+            return None 

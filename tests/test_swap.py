@@ -383,13 +383,18 @@ async def interactive_swap_test():
 
                                 formatted_usd = format_usd_value(usd_value)
 
+                                # Get market cap from token info
+                                market_cap = price_data['token_info'].get('market_cap')
+                                market_cap_display = f"${market_cap:,.2f}" if market_cap is not None else "No data"
+
                                 swap_complete_panel = (
                                     f"[green]Swap transaction submitted successfully![/green]\n\n"
                                     f"[bold white]🔄 Swap Summary:[/bold white]\n"
                                     f"[cyan]FROM:[/cyan] {formatted_input} {input_token} 💫\n"
                                     f"[cyan]TO:[/cyan] {formatted_output} {output_token} ✨\n"
                                     f"[dim white]Value:[/dim white] ${formatted_usd} USD\n"
-                                    f"[dim white]Fee:[/dim white] ${total_fees_sol * sol_price:.4f} USD\n\n"
+                                    f"[dim white]Fee:[/dim white] ${total_fees_sol * sol_price:.4f} USD\n"
+                                    f"[magenta]Market Cap:[/magenta] {market_cap_display}\n\n"
                                     f"[dim]Check Solscan for final confirmation status.[/dim]"
                                 )
                                 console.print(Panel(
