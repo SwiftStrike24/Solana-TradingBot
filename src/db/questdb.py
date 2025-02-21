@@ -19,6 +19,8 @@ class RPCMetrics:
     priority_fee: Optional[int]
     final_slippage_bps: Optional[int]
     total_fee_usd: Optional[float]  # Added field for total transaction fees in USD
+    retry_count: int = 0
+    slippage_adjustment: float = 0.0
 
 class QuestDBClient:
     def __init__(self):

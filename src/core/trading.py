@@ -144,8 +144,8 @@ class TradingBot:
             logger.error(f"Error getting token price: {str(e)}")
             return None
 
-    async def _get_quote(self, input_mint: str, output_mint: str, amount: int) -> Optional[dict]:
-        """Get quote from Jupiter."""
+    async def _get_quote(self, input_mint: str, output_mint: str, amount: int, slippage_bps: int = 50) -> Optional[dict]:
+        """Get quote from Jupiter with configurable slippage."""
         try:
             await asyncio.sleep(self.request_delay)
             url = f"{self.jupiter_swap_url}/quote"
@@ -153,7 +153,7 @@ class TradingBot:
                 "inputMint": input_mint,
                 "outputMint": output_mint,
                 "amount": str(amount),
-                "slippageBps": 50
+                "slippageBps": slippage_bps
             }
             response = requests.get(url, params=params)
             return response.json() if response.ok else None
@@ -224,251 +224,309 @@ class TradingBot:
             logger.error(f"Error getting swap quote:\n{str(e)}\n{'='*80}")
             return None
 
-    async def wait_for_confirmation(self, signature: Signature, max_retries: int = 10, retry_delay: float = 0.5) -> bool:
-        """Wait for transaction confirmation."""
-        try:
-            # Initial delay to allow transaction to propagate
-            await asyncio.sleep(1)
-            
-            # Single check for transaction status
-            response = self.client.get_signature_statuses([signature], search_transaction_history=True)
-            if not response or not response.value:
-                logger.error("Invalid response from get_signature_statuses")
-                return False
+    async def wait_for_confirmation(self, signature: Signature, max_retries: int = 15, retry_delay: float = 1) -> bool:
+        """Enhanced confirmation checking with retries."""
+        for attempt in range(max_retries):
+            try:
+                await asyncio.sleep(retry_delay * (attempt + 0.5))
+                response = self.client.get_signature_statuses([signature], search_transaction_history=True)
+                if not response or not response.value:
+                    logger.error("Invalid response from get_signature_statuses")
+                    return False
+                    
+                status = response.value[0]
                 
-            status = response.value[0]
-            
-            # If status is None, transaction not found
-            if status is None:
+                # If status is None, transaction not found
+                if status is None:
+                    logger.info("⏳ Transaction submitted, check Solscan for status")
+                    return True  # Return true since transaction was sent
+                
+                # Check for transaction error
+                if status.err:
+                    error_json = json.dumps(status.err, indent=2) if isinstance(status.err, dict) else str(status.err)
+                    logger.error(f"❌ Transaction failed with error: {error_json}")
+                    return False
+                
+                # Check confirmation status
+                if status.confirmation_status:
+                    if status.confirmation_status in ["confirmed", "finalized"]:
+                        logger.info(f"✅ Transaction {status.confirmation_status}")
+                        return True
+                    elif status.confirmation_status == "processed":
+                        logger.info("⏳ Transaction processed, check Solscan for final status")
+                        return True
+                
+                # No confirmation status but transaction exists
                 logger.info("⏳ Transaction submitted, check Solscan for status")
-                return True  # Return true since transaction was sent
-            
-            # Check for transaction error
-            if status.err:
-                error_json = json.dumps(status.err, indent=2) if isinstance(status.err, dict) else str(status.err)
-                logger.error(f"❌ Transaction failed with error: {error_json}")
-                return False
-            
-            # Check confirmation status
-            if status.confirmation_status:
-                if status.confirmation_status in ["confirmed", "finalized"]:
-                    logger.info(f"✅ Transaction {status.confirmation_status}")
-                    return True
-                elif status.confirmation_status == "processed":
-                    logger.info("⏳ Transaction processed, check Solscan for final status")
-                    return True
-            
-            # No confirmation status but transaction exists
-            logger.info("⏳ Transaction submitted, check Solscan for status")
-            return True
-            
-        except Exception as e:
-            if "commitment" not in str(e):  # Don't log the commitment error
-                logger.error(f"Error checking confirmation: {str(e)}")
-            return True  # Return true since transaction was sent
+                return True
+                
+            except Exception as e:
+                if "commitment" not in str(e):  # Don't log the commitment error
+                    logger.warning(f"Confirmation check attempt {attempt+1} failed: {str(e)}")
+                    
+        logger.error("Max confirmation retries exceeded")
+        return False
 
     async def execute_swap(self, quote: dict) -> Optional[dict]:
-        """Execute a swap transaction using Jupiter API with optimized parameters.
-        Returns a dictionary with transaction signature and dynamic slippage report if successful.
-        Example: { "tx_sig": <signature>, "dynamic_slippage_report": { ... } }
-        """
-        try:
-            if not self.keypair:
-                logger.error("No keypair provided for swap execution")
-                return None
-                
-            swap_url = f"{self.jupiter_swap_url}/swap"
-            
-            # Validate quote structure
-            validated_input = self._validate_address(quote.get('inputMint', ''))
-            validated_output = self._validate_address(quote.get('outputMint', ''))
-            if not validated_input or not validated_output:
-                return None
-            
-            swap_payload = {
-                "quoteResponse": quote,
-                "userPublicKey": str(self.keypair.pubkey()),
-                # Use versioned txns instead of legacy
-                "asLegacyTransaction": False,
-                # Safer routing by limiting intermediate tokens
-                "restrictIntermediateTokens": True,
-                # Auto-adjust compute units for optimal priority
-                "dynamicComputeUnitLimit": True,
-                # Auto-adjust slippage based on token metrics
-                "dynamicSlippage": True,
-                # Priority fee for network congestion (70% of total fee)
-                "prioritizationFeeLamports": PRIORITY_FEE_LAMPORTS,
-                # Jito MEV tip (30% of total fee)
-                "jitoTipLamports": JITO_TIP_LAMPORTS
-            }
-            
-            logger.info(f"Sending swap request with payload: {json.dumps(swap_payload, indent=2)}")
-            
-            response = requests.post(swap_url, json=swap_payload)
-            if not response.ok:
-                logger.error(f"Failed to get swap transaction: {response.text}")
-                return None
-                
-            swap_data = response.json()
-            logger.info(f"Received swap response: {json.dumps(swap_data, indent=2)}")
-            
-            dynamic_slippage_report = swap_data.get("dynamicSlippageReport")
-
-            # Get the encoded transaction
-            encoded_transaction = swap_data.get('swapTransaction')
-            if not encoded_transaction:
-                logger.error("No swap transaction in response")
-                return None
-
-            transaction_bytes = base64.b64decode(encoded_transaction)
-            
-            unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
-            
-            last_valid_block_height = swap_data.get('lastValidBlockHeight')
-            if not last_valid_block_height:
-                logger.error("No lastValidBlockHeight in response")
-                return None
-            
-            message = unsigned_tx.message
-            if isinstance(message, MessageV0):
-                signed_tx = VersionedTransaction(
-                    message,
-                    [self.keypair]
-                )
-                
-                serialized_tx = base64.b64encode(bytes(signed_tx)).decode('utf-8')
-                
-                rpc_request = {
-                    "jsonrpc": "2.0",
-                    "id": "1",
-                    "method": "sendTransaction",
-                    "params": [
-                        serialized_tx,
-                        {
-                            "encoding": "base64",
-                            "skipPreflight": True,
-                            "maxRetries": 5,
-                            "minContextSlot": swap_data.get('simulationSlot'),
-                            "lastValidBlockHeight": last_valid_block_height,
-                            "preflightCommitment": "confirmed"
-                        }
-                    ]
-                }
-                
-                logger.info(f"Sending transaction concurrently to both RPCs")
-                
-                const_jito_url = f"{JITO_RPC_URL}/api/v1/transactions"
-                jito_headers = {
-                    "Content-Type": "application/json",
-                    "User-Agent": "jito-client",
-                    "X-API-Version": "1"
-                }
-                helius_url = HELIUS_RPC_URL
-                helius_headers = { "Content-Type": "application/json" }
-
-                async def send_transaction(url: str, headers: dict) -> Optional[tuple[requests.Response, str, float]]:
-                    try:
-                        start_time = time.perf_counter()
-                        loop = asyncio.get_running_loop()
-                        response = await loop.run_in_executor(
-                            None,
-                            lambda: requests.post(url, json=rpc_request, headers=headers)
-                        )
-                        end_time = time.perf_counter()
-                        latency = (end_time - start_time) * 1000  # Convert to milliseconds
-                        
-                        if response and response.ok and 'result' in response.json():
-                            rpc_type = "jito" if url.startswith(JITO_RPC_URL) else "helius"
-                            return response, rpc_type, latency
-                    except Exception as e:
-                        logger.error(f"Error sending transaction to {url}: {str(e)}")
+        """Execute a swap transaction with retry logic and dynamic parameter adjustment."""
+        max_retries = 3
+        base_slippage = MAX_SLIPPAGE
+        retry_delay = 0.5  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                if not self.keypair:
+                    logger.error("No keypair provided for swap execution")
                     return None
-
-                # Create tasks for both RPCs
-                jito_task = asyncio.create_task(send_transaction(const_jito_url, jito_headers))
-                helius_task = asyncio.create_task(send_transaction(helius_url, helius_headers))
+                    
+                # Refresh quote with adjusted slippage before each attempt
+                adjusted_slippage = base_slippage * (1 + (attempt * 0.25))  # 25% increase per attempt
+                fresh_quote = await self._get_updated_quote(quote, adjusted_slippage)
                 
-                # Wait for first successful response
-                done, pending = await asyncio.wait(
-                    {jito_task, helius_task},
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+                if not fresh_quote:
+                    logger.error(f"Failed to refresh quote on attempt {attempt+1}")
+                    continue
 
-                valid_response = None
-                rpc_type = None
-                latency = None
+                swap_url = f"{self.jupiter_swap_url}/swap"
+                swap_payload = {
+                    "quoteResponse": fresh_quote,
+                    "userPublicKey": str(self.keypair.pubkey()),
+                    "asLegacyTransaction": False,
+                    "restrictIntermediateTokens": True,
+                    "dynamicComputeUnitLimit": True,
+                    "dynamicSlippage": True,
+                    "prioritizationFeeLamports": int(PRIORITY_FEE_LAMPORTS * (1 + attempt/10)),
+                    "jitoTipLamports": int(JITO_TIP_LAMPORTS * (1 + attempt/10))
+                }
 
-                for task in done:
-                    try:
-                        result = await task
-                        if result:
-                            valid_response, rpc_type, latency = result
-                            break
-                    except Exception as e:
-                        logger.error(f"Task error: {str(e)}")
-
-                # Cancel pending tasks
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+                logger.info(f"Swap attempt {attempt+1} with params: {json.dumps(swap_payload, indent=2)}")
                 
-                if valid_response:
-                    tx_sig = valid_response.json()["result"]
-                    request_url = valid_response.request.url if valid_response.request else ""
-                    jito_bundle_id = valid_response.headers.get("x-bundle-id") if request_url.startswith(JITO_RPC_URL) else None
-                    logger.info("🚀 Transaction Details:")
-                    logger.info(f"✅ Transaction sent successfully: {tx_sig}")
-                    if jito_bundle_id:
-                        logger.info(f"📦 Bundle ID: {jito_bundle_id}")
-                    # Get actual fees from swap_data
-                    priority_fee_lamports = swap_data.get("prioritizationFeeLamports", PRIORITY_FEE_LAMPORTS)
-                    jito_tip_lamports = swap_data.get("jitoTipLamports", JITO_TIP_LAMPORTS)
-                    
-                    # Calculate total fees using actual values
-                    total_route_fees = sum(float(route['swapInfo']['feeAmount']) / (10 ** (
-                        9 if route['swapInfo']['feeMint'] in [
-                            "11111111111111111111111111111111",
-                            "So11111111111111111111111111111111111111112"
-                        ] else 6
-                    )) for route in quote['routePlan'])
-                    
-                    total_fees_sol = (total_route_fees + (priority_fee_lamports + jito_tip_lamports) / 1e9)
-                    sol_price = await self.get_sol_price()
-                    total_fee_usd = total_fees_sol * sol_price
-                    
-                    metrics = RPCMetrics(
-                        timestamp=datetime.utcnow(),
-                        rpc_type=rpc_type,
-                        latency_ms=latency,
-                        success=True,
-                        tx_signature=tx_sig,
-                        route_count=len(quote.get('routePlan', [])),
-                        slippage_bps=int(float(quote.get('slippageBps', 0))),
-                        compute_units=swap_data.get('computeUnitLimit'),
-                        priority_fee=priority_fee_lamports,  # Use actual priority fee
-                        final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100)),
-                        total_fee_usd=total_fee_usd
+                response = requests.post(swap_url, json=swap_payload)
+                if not response.ok:
+                    logger.error(f"Failed to get swap transaction: {response.text}")
+                    continue
+                
+                swap_data = response.json()
+                logger.info(f"Received swap response: {json.dumps(swap_data, indent=2)}")
+                
+                dynamic_slippage_report = swap_data.get("dynamicSlippageReport")
+
+                # Get the encoded transaction
+                encoded_transaction = swap_data.get('swapTransaction')
+                if not encoded_transaction:
+                    logger.error("No swap transaction in response")
+                    continue
+
+                transaction_bytes = base64.b64decode(encoded_transaction)
+                
+                unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
+                
+                last_valid_block_height = swap_data.get('lastValidBlockHeight')
+                if not last_valid_block_height:
+                    logger.error("No lastValidBlockHeight in response")
+                    continue
+                
+                message = unsigned_tx.message
+                if isinstance(message, MessageV0):
+                    signed_tx = VersionedTransaction(
+                        message,
+                        [self.keypair]
                     )
-                    self.questdb.record_rpc_metrics(metrics)
-                    return {
-                        "tx_sig": tx_sig,
-                        "dynamic_slippage_report": dynamic_slippage_report,
-                        "jito_bundle_id": jito_bundle_id,
-                        "rpc_used": rpc_type,
-                        "rpc_latency": latency
+                    
+                    serialized_tx = base64.b64encode(bytes(signed_tx)).decode('utf-8')
+                    
+                    rpc_request = {
+                        "jsonrpc": "2.0",
+                        "id": "1",
+                        "method": "sendTransaction",
+                        "params": [
+                            serialized_tx,
+                            {
+                                "encoding": "base64",
+                                "skipPreflight": True,
+                                "maxRetries": 5,
+                                "minContextSlot": swap_data.get('simulationSlot'),
+                                "lastValidBlockHeight": last_valid_block_height,
+                                "preflightCommitment": "confirmed"
+                            }
+                        ]
                     }
+                    
+                    logger.info(f"Sending transaction concurrently to both RPCs")
+                    
+                    const_jito_url = f"{JITO_RPC_URL}/api/v1/transactions"
+                    jito_headers = {
+                        "Content-Type": "application/json",
+                        "User-Agent": "jito-client",
+                        "X-API-Version": "1"
+                    }
+                    helius_url = HELIUS_RPC_URL
+                    helius_headers = { "Content-Type": "application/json" }
+
+                    async def send_transaction(url: str, headers: dict) -> Optional[tuple[requests.Response, str, float]]:
+                        try:
+                            start_time = time.perf_counter()
+                            loop = asyncio.get_running_loop()
+                            response = await loop.run_in_executor(
+                                None,
+                                lambda: requests.post(url, json=rpc_request, headers=headers)
+                            )
+                            end_time = time.perf_counter()
+                            latency = (end_time - start_time) * 1000  # Convert to milliseconds
+                            
+                            if response and response.ok and 'result' in response.json():
+                                rpc_type = "jito" if url.startswith(JITO_RPC_URL) else "helius"
+                                return response, rpc_type, latency
+                        except Exception as e:
+                            logger.error(f"Error sending transaction to {url}: {str(e)}")
+                        return None
+
+                    # Create tasks for both RPCs
+                    jito_task = asyncio.create_task(send_transaction(const_jito_url, jito_headers))
+                    helius_task = asyncio.create_task(send_transaction(helius_url, helius_headers))
+                    
+                    # Wait for first successful response
+                    done, pending = await asyncio.wait(
+                        {jito_task, helius_task},
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    valid_response = None
+                    rpc_type = None
+                    latency = None
+
+                    for task in done:
+                        try:
+                            result = await task
+                            if result:
+                                valid_response, rpc_type, latency = result
+                                break
+                        except Exception as e:
+                            logger.error(f"Task error: {str(e)}")
+
+                    # Cancel pending tasks
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    if valid_response:
+                        tx_sig = valid_response.json()["result"]
+                        request_url = valid_response.request.url if valid_response.request else ""
+                        jito_bundle_id = valid_response.headers.get("x-bundle-id") if request_url.startswith(JITO_RPC_URL) else None
+                        logger.info("🚀 Transaction Details:")
+                        logger.info(f"✅ Transaction sent successfully: {tx_sig}")
+                        if jito_bundle_id:
+                            logger.info(f"📦 Bundle ID: {jito_bundle_id}")
+
+                        try:
+                            # Get actual fees from swap_data with fallbacks
+                            priority_fee_lamports = swap_data.get("prioritizationFeeLamports", PRIORITY_FEE_LAMPORTS)
+                            jito_tip_lamports = swap_data.get("jitoTipLamports", JITO_TIP_LAMPORTS)
+                            
+                            # Calculate total route fees with safety checks
+                            total_route_fees = 0
+                            for route in quote.get('routePlan', []):
+                                try:
+                                    fee_amount = float(route['swapInfo']['feeAmount'])
+                                    fee_mint = route['swapInfo']['feeMint']
+                                    decimals = 9 if fee_mint in [
+                                        "11111111111111111111111111111111",
+                                        "So11111111111111111111111111111111111111112"
+                                    ] else 6
+                                    total_route_fees += fee_amount / (10 ** decimals)
+                                except (KeyError, ValueError, TypeError) as e:
+                                    logger.warning(f"Error calculating route fee: {e}")
+                                    continue
+
+                            # Calculate total fees in SOL
+                            total_fees_sol = (total_route_fees + (priority_fee_lamports + jito_tip_lamports) / 1e9)
+
+                            # Get SOL price with fallback
+                            try:
+                                sol_price = await self.get_sol_price()
+                                if sol_price is None or sol_price <= 0:
+                                    logger.warning("Invalid SOL price, using fallback from quote")
+                                    # Try to derive price from quote's USD value
+                                    if quote.get('swapUsdValue') and quote.get('inAmount'):
+                                        sol_price = float(quote['swapUsdValue']) / (float(quote['inAmount']) / 1e9)
+                                    else:
+                                        sol_price = 0
+                            except Exception as e:
+                                logger.warning(f"Error getting SOL price: {e}")
+                                sol_price = 0
+
+                            # Calculate total fee in USD with safety check
+                            total_fee_usd = total_fees_sol * sol_price if sol_price > 0 else 0
+
+                            # Create metrics object with safe values
+                            metrics = RPCMetrics(
+                                timestamp=datetime.utcnow(),
+                                rpc_type=rpc_type,
+                                latency_ms=latency or 0,
+                                success=True,
+                                tx_signature=tx_sig,
+                                route_count=len(quote.get('routePlan', [])),
+                                slippage_bps=int(float(quote.get('slippageBps', 0))),
+                                compute_units=swap_data.get('computeUnitLimit'),
+                                priority_fee=priority_fee_lamports,
+                                final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100)),
+                                total_fee_usd=total_fee_usd
+                            )
+
+                            # Add retry metadata to metrics
+                            metrics.retry_count = attempt
+                            metrics.slippage_adjustment = adjusted_slippage
+                            self.questdb.record_rpc_metrics(metrics)
+                            
+                            return {
+                                "tx_sig": tx_sig,
+                                "retries": attempt,
+                                "adjusted_slippage": adjusted_slippage,
+                                "dynamic_slippage_report": dynamic_slippage_report,
+                                "jito_bundle_id": jito_bundle_id,
+                                "rpc_used": rpc_type,
+                                "rpc_latency": latency,
+                                "total_fee_usd": total_fee_usd
+                            }
+
+                        except Exception as e:
+                            logger.error(f"Error processing fees and metrics: {e}")
+                            # Return basic success response if fee calculation fails
+                            return {
+                                "tx_sig": tx_sig,
+                                "retries": attempt,
+                                "adjusted_slippage": adjusted_slippage,
+                                "rpc_used": rpc_type,
+                                "rpc_latency": latency
+                            }
+
                 else:
-                    logger.error("Both RPC requests failed to return a valid response.")
+                    logger.error("Unexpected transaction message format")
                     return None
-            else:
-                logger.error("Unexpected transaction message format")
-                return None
-            
+                
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1} failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay}s...")
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    
+        logger.error(f"Transaction failed after {max_retries} attempts")
+        return None
+
+    async def _get_updated_quote(self, original_quote: dict, slippage: float) -> Optional[dict]:
+        """Refresh quote with updated parameters."""
+        try:
+            return await self._get_quote(
+                input_mint=original_quote['inputMint'],
+                output_mint=original_quote['outputMint'],
+                amount=int(original_quote['inAmount']),
+                slippage_bps=int(slippage * 10000)
+            )
         except Exception as e:
-            logger.error(f"Error executing swap: {str(e)}")
+            logger.error(f"Error refreshing quote: {str(e)}")
             return None
 
     async def get_new_tokens(self, limit: int = 100, offset: int = 0) -> Optional[list]:

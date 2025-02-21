@@ -130,13 +130,62 @@ async def interactive_swap_test():
                         console.print(format_swap_quote(quote, price_data.get('token_info'), all_tokens_info))
                         
                         # Calculate and display fee breakdown
-                        total_route_fees = sum(float(route['swapInfo']['feeAmount']) / (10 ** (
-                            9 if route['swapInfo']['feeMint'] in [
-                                "11111111111111111111111111111111",
-                                "So11111111111111111111111111111111111111112"
-                            ] else 6
-                        )) for route in quote['routePlan'])
-                        
+                        total_route_fees = 0
+                        fee_details = []
+
+                        for route in quote['routePlan']:
+                            swap = route['swapInfo']
+                            fee_amount = float(swap['feeAmount'])
+                            fee_mint = swap['feeMint']
+                            
+                            # Skip system program fees (all zeros)
+                            if fee_mint == "11111111111111111111111111111111":
+                                continue
+                                
+                            # Get fee token info with better fallback
+                            fee_token = all_tokens_info.get(fee_mint, {})
+                            if not fee_token:
+                                # Try to get token info directly if not in batch results
+                                token_info = await bot.get_token_info(fee_mint)
+                                if token_info:
+                                    fee_token = token_info
+                                    all_tokens_info[fee_mint] = token_info  # Cache it
+                                else:
+                                    # Handle system program and SOL addresses
+                                    if fee_mint in ["11111111111111111111111111111111", "So11111111111111111111111111111111111111112"]:
+                                        fee_token = {'symbol': 'SOL', 'decimals': 9}
+                                    else:
+                                        fee_token = {'symbol': f"Token-{fee_mint[:4]}", 'decimals': 6}
+                            
+                            fee_decimals = fee_token.get('decimals', 6)
+                            actual_fee = fee_amount / (10 ** fee_decimals)
+                            
+                            # For non-SOL fees, we need to get their SOL equivalent
+                            if fee_mint not in ["11111111111111111111111111111111", "So11111111111111111111111111111111111111112"]:
+                                try:
+                                    # Get quote to convert fee token to SOL
+                                    reverse_quote = await bot._get_quote(
+                                        input_mint=fee_mint,
+                                        output_mint="So11111111111111111111111111111111111111112",
+                                        amount=int(fee_amount)  # Use original amount in base units
+                                    )
+                                    if reverse_quote and 'outAmount' in reverse_quote:
+                                        fee_in_sol = float(reverse_quote['outAmount']) / 1e9
+                                    else:
+                                        fee_in_sol = 0
+                                except Exception as e:
+                                    logger.warning(f"Failed to convert fee to SOL: {e}")
+                                    fee_in_sol = 0
+                            else:
+                                fee_in_sol = actual_fee
+                            
+                            total_route_fees += fee_in_sol
+                            fee_details.append({
+                                'token': fee_token['symbol'],
+                                'amount': actual_fee,
+                                'sol_equivalent': fee_in_sol
+                            })
+
                         # Use actual fees from quote if available, otherwise use defaults
                         priority_fee_sol = quote.get('prioritizationFeeLamports', PRIORITY_FEE_LAMPORTS) / 1e9
                         jito_tip_sol = quote.get('jitoTipLamports', JITO_TIP_LAMPORTS) / 1e9
@@ -145,6 +194,7 @@ async def interactive_swap_test():
                         # Get current SOL price for USD conversion
                         sol_price = await coingecko.get_sol_price()
                         
+                        # Format fee breakdown with improved details
                         fee_breakdown = (
                             f"[bold white]💰 Transaction Fee Breakdown[/bold white]\n\n"
                             f"[cyan]Network Fees:[/cyan]\n"
@@ -153,29 +203,46 @@ async def interactive_swap_test():
                             f"└─ 🔄 Route Fees: [green]{total_route_fees:.6f} SOL[/green] (${total_route_fees * sol_price:.4f})\n\n"
                             f"[bold cyan]Route Details:[/bold cyan]"
                         )
-                        
+
                         for idx, route in enumerate(quote['routePlan'], 1):
                             swap = route['swapInfo']
                             fee_amount = float(swap['feeAmount'])
-                            fee_token = all_tokens_info.get(swap['feeMint'], {'symbol': 'Unknown'})
+                            fee_mint = swap['feeMint']
                             
-                            # Get correct decimals for fee token
-                            if swap['feeMint'] == "11111111111111111111111111111111" or \
-                               swap['feeMint'] == "So11111111111111111111111111111111111111112":
-                                fee_decimals = 9  # SOL decimals
-                            else:
-                                fee_decimals = fee_token.get('decimals', 6)
+                            # Get fee token info with better fallback
+                            fee_token = all_tokens_info.get(fee_mint, {})
+                            if not fee_token:
+                                # Try to get token info directly if not in batch results
+                                token_info = await bot.get_token_info(fee_mint)
+                                if token_info:
+                                    fee_token = token_info
+                                    all_tokens_info[fee_mint] = token_info  # Cache it
+                                else:
+                                    # Handle system program and SOL addresses
+                                    if fee_mint in ["11111111111111111111111111111111", "So11111111111111111111111111111111111111112"]:
+                                        fee_token = {'symbol': 'SOL', 'decimals': 9}
+                                    else:
+                                        fee_token = {'symbol': f"Token-{fee_mint[:4]}", 'decimals': 6}
                             
-                            # Calculate actual fee amount with correct decimals
+                            fee_decimals = fee_token.get('decimals', 6)
                             actual_fee = fee_amount / (10 ** fee_decimals)
+                            
+                            # Find the SOL equivalent from our previous calculations
+                            fee_detail = next((d for d in fee_details if d['token'] == fee_token['symbol'] and d['amount'] == actual_fee), None)
+                            sol_equivalent = fee_detail['sol_equivalent'] if fee_detail else 0
+                            
+                            # Format fee string, including zero fees
+                            fee_str = (
+                                f"{actual_fee:.6f} {fee_token['symbol']}"
+                                f"{f' (≈{sol_equivalent:.6f} SOL)' if fee_token['symbol'] != 'SOL' and sol_equivalent > 0 else ''}"
+                            )
                             
                             fee_breakdown += (
                                 f"\n{'└─' if idx == len(quote['routePlan']) else '├─'} [yellow]Step {idx}[/yellow] "
                                 f"via [blue]{swap['label']}[/blue]\n"
-                                f"   {'  ' if idx == len(quote['routePlan']) else '│ '} Fee: [green]{actual_fee:.6f}[/green] "
-                                f"{fee_token['symbol']}"
+                                f"   {'  ' if idx == len(quote['routePlan']) else '│ '} Fee: [green]{fee_str}[/green]"
                             )
-                        
+
                         fee_breakdown += (
                             f"\n\n[bold white]Total Cost:[/bold white]\n"
                             f"[bold green]{total_fees_sol:.6f} SOL[/bold green] "
