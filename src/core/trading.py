@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import requests
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey
@@ -21,8 +21,30 @@ import time
 from src.db.questdb import QuestDBClient, RPCMetrics
 from datetime import datetime
 from src.services.coingecko import CoinGeckoAPI
+import aiohttp
+from numba import jit, prange
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+import functools
+import os
 
 logger = logging.getLogger(__name__)
+
+# Numba optimized functions for CPU-intensive operations
+@jit(nopython=True, parallel=True)
+def _calculate_price_impacts(amounts: np.ndarray, pool_sizes: np.ndarray) -> np.ndarray:
+    """Optimized parallel price impact calculation"""
+    impacts = np.zeros_like(amounts, dtype=np.float64)
+    for i in prange(len(amounts)):
+        impacts[i] = amounts[i] / (pool_sizes[i] + amounts[i]) * 100
+    return impacts
+
+@jit(nopython=True)
+def _calculate_optimal_route(routes: np.ndarray, fees: np.ndarray) -> Tuple[int, float]:
+    """Optimized route selection based on fees and latency"""
+    route_scores = routes * (1 - fees)
+    best_idx = np.argmax(route_scores)
+    return best_idx, route_scores[best_idx]
 
 class TradingBot:
     def __init__(self, keypair=None):
@@ -40,7 +62,143 @@ class TradingBot:
         self.keypair = keypair
         self._token_cache = {}
         self.questdb = QuestDBClient()
+        self._session = None
+        self._latency_history = []
+        self.MAX_LATENCY_HISTORY = 100
+        
+        # Add thread pool for CPU-intensive tasks
+        self._thread_pool = ThreadPoolExecutor(
+            max_workers=min(32, (os.cpu_count() or 1) * 4),
+            thread_name_prefix="trading_worker"
+        )
+        
+        # Optimize session management
+        self._session_pool = {}
+        self._session_semaphore = asyncio.Semaphore(100)  # Limit concurrent connections
     
+    async def _get_session(self, endpoint: str) -> aiohttp.ClientSession:
+        """Get or create optimized aiohttp session with connection pooling"""
+        if endpoint not in self._session_pool or self._session_pool[endpoint].closed:
+            connector = aiohttp.TCPConnector(
+                limit=0,  # No limit on connections
+                ttl_dns_cache=300,  # Cache DNS results for 5 minutes
+                use_dns_cache=True,
+                ssl=False  # Disable SSL for internal RPCs if secure
+            )
+            self._session_pool[endpoint] = aiohttp.ClientSession(
+                connector=connector,
+                headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+        return self._session_pool[endpoint]
+
+    async def _parallel_rpc_request(self, method: str, params: list, endpoints: List[str] = None) -> Tuple[Optional[dict], str, float]:
+        """Execute RPC request across multiple endpoints in parallel"""
+        if endpoints is None:
+            endpoints = [HELIUS_RPC_URL, JITO_RPC_URL]
+        elif isinstance(endpoints, str):
+            endpoints = [endpoints]  # Convert single endpoint to list
+            
+        def get_rpc_name(endpoint: str) -> str:
+            """Get clean RPC name from endpoint URL"""
+            if "helius" in endpoint.lower():
+                return "Helius"
+            elif "jito" in endpoint.lower():
+                return "Jito"
+            return "Unknown"
+            
+        async def try_endpoint(endpoint: str) -> Tuple[Optional[dict], str, float]:
+            start_time = time.perf_counter()
+            try:
+                session = await self._get_session(endpoint)
+                async with self._session_semaphore:
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": str(int(time.time() * 1000)),
+                        "method": method,
+                        "params": params
+                    }
+                    logger.info(f"Sending RPC request to {get_rpc_name(endpoint)}...")
+                    
+                    async with session.post(endpoint, json=payload) as response:
+                        if response.status == 200:
+                            result = await response.json()
+                            latency = (time.perf_counter() - start_time) * 1000
+                            
+                            # Check for RPC-specific errors
+                            if "error" in result:
+                                error = result["error"]
+                                logger.error(f"RPC error from {get_rpc_name(endpoint)}: {error}")
+                                return None, get_rpc_name(endpoint), float('inf')
+                                
+                            return result, get_rpc_name(endpoint), latency
+                        else:
+                            text = await response.text()
+                            logger.error(f"RPC request failed for {get_rpc_name(endpoint)} with status {response.status}: {text}")
+            except Exception as e:
+                logger.error(f"RPC request failed for {get_rpc_name(endpoint)}: {str(e)}")
+            return None, get_rpc_name(endpoint), float('inf')
+
+        try:
+            # Execute requests in parallel
+            tasks = [try_endpoint(endpoint) for endpoint in endpoints]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Filter successful responses and handle exceptions
+            valid_responses = []
+            for response in responses:
+                if isinstance(response, Exception):
+                    logger.error(f"RPC request failed with exception: {str(response)}")
+                    continue
+                if response[0] is not None:  # Check if we got a valid response
+                    valid_responses.append(response)
+            
+            if not valid_responses:
+                logger.error("All RPC endpoints failed")
+                return None, "Unknown", float('inf')
+                
+            # Get fastest successful response
+            return min(valid_responses, key=lambda x: x[2])
+            
+        except Exception as e:
+            logger.error(f"Parallel RPC request failed: {str(e)}")
+            return None, "Unknown", float('inf')
+
+    async def _fetch(self, url: str, method: str = "get", **kwargs) -> Optional[dict]:
+        """Generic fetch method with latency tracking"""
+        session = await self._get_session(url)
+        start_time = time.perf_counter()
+        try:
+            async with getattr(session, method)(url, **kwargs) as response:
+                latency = (time.perf_counter() - start_time) * 1000  # Convert to ms
+                self._update_latency_history(latency)
+                
+                if response.status == 200:
+                    return await response.json()
+                logger.error(f"API request failed: {response.status} - {await response.text()}")
+                return None
+        except Exception as e:
+            logger.error(f"Error in _fetch: {str(e)}")
+            return None
+
+    def _update_latency_history(self, latency: float):
+        """Update rolling latency history"""
+        self._latency_history.append(latency)
+        if len(self._latency_history) > self.MAX_LATENCY_HISTORY:
+            self._latency_history.pop(0)
+
+    async def get_avg_latency(self) -> float:
+        """Get average latency from history"""
+        if not self._latency_history:
+            return 0
+        return sum(self._latency_history) / len(self._latency_history)
+
+    async def get_dynamic_delay(self) -> float:
+        """Calculate dynamic delay based on latency history"""
+        avg_latency = await self.get_avg_latency()
+        # Convert ms to seconds and cap at reasonable limits
+        return min(max(avg_latency / 2000, 0.01), 0.1)  # Min 10ms, Max 100ms
+
     def _validate_address(self, address: str) -> Optional[str]:
         """Validate and convert address to string format."""
         try:
@@ -66,7 +224,7 @@ class TradingBot:
                     'name': 'Solana',
                     'decimals': 9,
                     'tags': ['native'],
-                    'daily_volume': None,  # Could fetch from another source if needed
+                    'daily_volume': None,
                     'logo_uri': 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png',
                     'verified': True,
                     'created_at': None,
@@ -78,27 +236,29 @@ class TradingBot:
             url = f"{self.jupiter_token_url}/token/{validated_address}"
             logger.info(f"\n{'='*80}\nFetching token info for: {validated_address}\nURL: {url}\n{'='*80}")
             
-            response = requests.get(url)
+            # Use dynamic delay based on latency history
+            delay = await self.get_dynamic_delay()
+            await asyncio.sleep(delay)
             
-            if not response.ok:
-                logger.warning(f"Failed to get token info: Status {response.status_code}\nResponse: {response.text}")
+            response = await self._fetch(url)
+            if not response:
+                logger.warning(f"Failed to get token info for {validated_address}")
                 return None
                 
-            token_info = response.json()
-            logger.info(f"\n{'='*80}\nToken Info Response:\n{json.dumps(token_info, indent=2)}\n{'='*80}")
+            logger.info(f"\n{'='*80}\nToken Info Response:\n{json.dumps(response, indent=2)}\n{'='*80}")
             
             return {
-                'symbol': token_info.get('symbol', 'Unknown'),
-                'name': token_info.get('name', 'Unknown Token'),
-                'decimals': token_info.get('decimals', 6),
-                'tags': token_info.get('tags', []),
-                'daily_volume': token_info.get('daily_volume', 0),
-                'logo_uri': token_info.get('logoURI'),
-                'verified': 'verified' in token_info.get('tags', []),
-                'created_at': token_info.get('created_at'),
-                'mint_authority': token_info.get('mint_authority'),
-                'freeze_authority': token_info.get('freeze_authority'),
-                'permanent_delegate': token_info.get('permanent_delegate')
+                'symbol': response.get('symbol', 'Unknown'),
+                'name': response.get('name', 'Unknown Token'),
+                'decimals': response.get('decimals', 6),
+                'tags': response.get('tags', []),
+                'daily_volume': response.get('daily_volume', 0),
+                'logo_uri': response.get('logoURI'),
+                'verified': 'verified' in response.get('tags', []),
+                'created_at': response.get('created_at'),
+                'mint_authority': response.get('mint_authority'),
+                'freeze_authority': response.get('freeze_authority'),
+                'permanent_delegate': response.get('permanent_delegate')
             }
         except Exception as e:
             logger.error(f"Error getting token info:\n{str(e)}\n{'='*80}")
@@ -168,7 +328,10 @@ class TradingBot:
     async def _get_quote(self, input_mint: str, output_mint: str, amount: int, slippage_bps: int = 50) -> Optional[dict]:
         """Get quote from Jupiter with configurable slippage."""
         try:
-            await asyncio.sleep(self.request_delay)
+            # Use dynamic delay based on latency history
+            delay = await self.get_dynamic_delay()
+            await asyncio.sleep(delay)
+            
             url = f"{self.jupiter_swap_url}/quote"
             params = {
                 "inputMint": input_mint,
@@ -176,13 +339,12 @@ class TradingBot:
                 "amount": str(amount),
                 "slippageBps": slippage_bps
             }
-            response = requests.get(url, params=params)
-            return response.json() if response.ok else None
+            return await self._fetch(url, params=params)
         except Exception as e:
             logger.error(f"Error getting quote: {str(e)}")
             return None
 
-    def check_liquidity(self, token_address: str) -> dict:
+    async def check_liquidity(self, token_address: str) -> dict:
         """Check token liquidity metrics."""
         try:
             # Validate token address
@@ -190,7 +352,7 @@ class TradingBot:
             if not validated_address:
                 return {'has_liquidity': False, 'reason': 'Invalid token address'}
             
-            quote = self.get_swap_quote(
+            quote = await self.get_swap_quote(
                 input_mint=self.sol_mint,
                 output_mint=validated_address,
                 amount=int(MIN_LIQUIDITY_SOL * 1e9)
@@ -211,7 +373,7 @@ class TradingBot:
             logger.error(f"Error checking liquidity: {str(e)}")
             return {'has_liquidity': False, 'reason': str(e)}
 
-    def get_swap_quote(self, input_mint: str, output_mint: str, amount: int) -> Optional[Dict]:
+    async def get_swap_quote(self, input_mint: str, output_mint: str, amount: int) -> Optional[Dict]:
         """Get swap quote from Jupiter."""
         try:
             # Validate input and output mints
@@ -231,13 +393,11 @@ class TradingBot:
             
             logger.info(f"\n{'='*80}\nFetching swap quote\nURL: {url}\nParams: {json.dumps(params, indent=2)}\n{'='*80}")
             
-            response = requests.get(url, params=params)
-            
-            if not response.ok:
-                logger.error(f"Failed to get swap quote: Status {response.status_code}\nResponse: {response.text}")
+            quote = await self._fetch(url, params=params)
+            if not quote:
+                logger.error("Failed to get swap quote")
                 return None
                 
-            quote = response.json()
             logger.info(f"\n{'='*80}\nSwap Quote Response:\n{json.dumps(quote, indent=2)}\n{'='*80}")
             
             return quote
@@ -289,26 +449,25 @@ class TradingBot:
         return False
 
     async def execute_swap(self, quote: dict) -> Optional[dict]:
-        """Execute a swap transaction with retry logic and dynamic parameter adjustment."""
+        """Optimized swap execution with parallel processing"""
         max_retries = 3
         base_slippage = MAX_SLIPPAGE
-        retry_delay = 0.5  # seconds
         
         for attempt in range(max_retries):
             try:
                 if not self.keypair:
                     logger.error("No keypair provided for swap execution")
-                    return None
+                    return {"success": False, "error": "No keypair provided", "retries": attempt}
                     
-                # Refresh quote with adjusted slippage before each attempt
-                adjusted_slippage = base_slippage * (1 + (attempt * 0.25))  # 25% increase per attempt
+                # Refresh quote with adjusted slippage using parallel RPC
+                adjusted_slippage = base_slippage * (1 + (attempt * 0.25))
                 fresh_quote = await self._get_updated_quote(quote, adjusted_slippage)
                 
                 if not fresh_quote:
                     logger.error(f"Failed to refresh quote on attempt {attempt+1}")
                     continue
 
-                swap_url = f"{self.jupiter_swap_url}/swap"
+                # Prepare swap transaction with optimized parameters
                 swap_payload = {
                     "quoteResponse": fresh_quote,
                     "userPublicKey": str(self.keypair.pubkey()),
@@ -320,313 +479,147 @@ class TradingBot:
                     "jitoTipLamports": int(JITO_TIP_LAMPORTS * (1 + attempt/10))
                 }
 
-                logger.info(f"Swap attempt {attempt+1} with params: {json.dumps(swap_payload, indent=2)}")
+                # Get swap transaction data with parallel RPC request
+                logger.info("Getting swap transaction data...")
+                swap_result = await self._fetch(
+                    f"{self.jupiter_swap_url}/swap",
+                    method="post",
+                    json=swap_payload
+                )
                 
-                response = requests.post(swap_url, json=swap_payload)
-                if not response.ok:
-                    logger.error(f"Failed to get swap transaction: {response.text}")
-                    continue
-                
-                swap_data = response.json()
-                logger.info(f"Received swap response: {json.dumps(swap_data, indent=2)}")
-
-                # Check for simulation errors before proceeding
-                simulation_error = swap_data.get("simulationError")
-                if simulation_error:
-                    error_code = simulation_error.get("errorCode")
-                    error_msg = simulation_error.get("error")
-                    logger.error(f"Simulation failed on attempt {attempt+1}: {error_code} - {error_msg}")
-                    
-                    # Record failed attempt in QuestDB
-                    metrics = RPCMetrics(
-                        timestamp=datetime.utcnow(),
-                        rpc_type="simulation",
-                        latency_ms=0,
-                        success=False,
-                        tx_signature=None,
-                        route_count=len(quote.get('routePlan', [])),
-                        slippage_bps=int(adjusted_slippage * 10000),
-                        compute_units=swap_data.get('computeUnitLimit'),
-                        priority_fee=swap_payload['prioritizationFeeLamports'],
-                        final_slippage_bps=None,
-                        total_fee_usd=0,
-                        swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
-                        retry_count=attempt,
-                        slippage_adjustment=adjusted_slippage
-                    )
-                    self.questdb.record_rpc_metrics(metrics)
-                    
-                    # If this is the last attempt, return failure details
-                    if attempt == max_retries - 1:
-                        return {
-                            "success": False,
-                            "error": error_msg,
-                            "error_code": error_code,
-                            "retries": attempt + 1
-                        }
+                if not swap_result:
+                    logger.error("Failed to get swap transaction data")
                     continue
 
-                dynamic_slippage_report = swap_data.get("dynamicSlippageReport")
-                encoded_transaction = swap_data.get('swapTransaction')
+                # Process transaction data
+                encoded_transaction = swap_result.get('swapTransaction')
                 if not encoded_transaction:
                     logger.error("No swap transaction in response")
                     continue
 
-                transaction_bytes = base64.b64decode(encoded_transaction)
-                unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
-                
-                last_valid_block_height = swap_data.get('lastValidBlockHeight')
-                if not last_valid_block_height:
-                    logger.error("No lastValidBlockHeight in response")
-                    continue
-                
-                message = unsigned_tx.message
-                if isinstance(message, MessageV0):
-                    signed_tx = VersionedTransaction(
-                        message,
-                        [self.keypair]
-                    )
-                    
-                    serialized_tx = base64.b64encode(bytes(signed_tx)).decode('utf-8')
-                    
-                    rpc_request = {
-                        "jsonrpc": "2.0",
-                        "id": "1",
-                        "method": "sendTransaction",
-                        "params": [
-                            serialized_tx,
-                            {
-                                "encoding": "base64",
-                                "skipPreflight": True,
-                                "maxRetries": 5,
-                                "minContextSlot": swap_data.get('simulationSlot'),
-                                "lastValidBlockHeight": last_valid_block_height,
-                                "preflightCommitment": "confirmed"
-                            }
-                        ]
-                    }
-                    
-                    logger.info(f"Sending transaction concurrently to both RPCs")
-                    
-                    const_jito_url = f"{JITO_RPC_URL}/api/v1/transactions"
-                    jito_headers = {
-                        "Content-Type": "application/json",
-                        "User-Agent": "jito-client",
-                        "X-API-Version": "1"
-                    }
-                    helius_url = HELIUS_RPC_URL
-                    helius_headers = { "Content-Type": "application/json" }
+                # Process transaction synchronously since these are CPU-bound operations
+                try:
+                    # Decode transaction
+                    transaction_bytes = base64.b64decode(encoded_transaction)
+                    unsigned_tx = VersionedTransaction.from_bytes(transaction_bytes)
 
-                    async def send_transaction(url: str, headers: dict) -> Optional[tuple[requests.Response, str, float]]:
-                        try:
-                            start_time = time.perf_counter()
-                            loop = asyncio.get_running_loop()
-                            response = await loop.run_in_executor(
-                                None,
-                                lambda: requests.post(url, json=rpc_request, headers=headers)
-                            )
-                            end_time = time.perf_counter()
-                            latency = (end_time - start_time) * 1000  # Convert to milliseconds
+                    # Sign transaction
+                    message = unsigned_tx.message
+                    if isinstance(message, MessageV0):
+                        signed_tx = VersionedTransaction(message, [self.keypair])
+                        serialized_tx = base64.b64encode(bytes(signed_tx)).decode('utf-8')
+                        
+                        # Send transaction to multiple RPCs in parallel
+                        rpc_request = {
+                            "jsonrpc": "2.0",
+                            "id": str(int(time.time() * 1000)),
+                            "method": "sendTransaction",
+                            "params": [
+                                serialized_tx,
+                                {
+                                    "encoding": "base64",
+                                    "skipPreflight": True,
+                                    "maxRetries": 5,
+                                    "minContextSlot": swap_result.get('simulationSlot'),
+                                    "lastValidBlockHeight": swap_result.get('lastValidBlockHeight'),
+                                    "preflightCommitment": "confirmed"
+                                }
+                            ]
+                        }
+
+                        # Try both RPCs in parallel
+                        result = await self._parallel_rpc_request(
+                            "sendTransaction",
+                            rpc_request["params"]
+                        )
+                        
+                        if not result:
+                            logger.error("Failed to send transaction to any RPC")
+                            continue
                             
-                            if response and response.ok and 'result' in response.json():
-                                rpc_type = "jito" if url.startswith(JITO_RPC_URL) else "helius"
-                                return response, rpc_type, latency
-                        except Exception as e:
-                            logger.error(f"Error sending transaction to {url}: {str(e)}")
-                        return None
+                        response, rpc_type, latency = result
 
-                    # Create tasks for both RPCs
-                    jito_task = asyncio.create_task(send_transaction(const_jito_url, jito_headers))
-                    helius_task = asyncio.create_task(send_transaction(helius_url, helius_headers))
-                    
-                    # Wait for first successful response
-                    done, pending = await asyncio.wait(
-                        {jito_task, helius_task},
-                        return_when=asyncio.FIRST_COMPLETED
-                    )
+                        if response and "result" in response:
+                            tx_sig = response["result"]
+                            if not tx_sig:
+                                logger.error("No transaction signature in response")
+                                continue
+                                
+                            logger.info(f"Transaction sent via {rpc_type} RPC with latency {latency:.2f}ms")
+                            logger.info(f"Signature: {tx_sig}")
 
-                    valid_response = None
-                    rpc_type = None
-                    latency = None
-
-                    for task in done:
-                        try:
-                            result = await task
-                            if result:
-                                valid_response, rpc_type, latency = result
-                                break
-                        except Exception as e:
-                            logger.error(f"Task error: {str(e)}")
-
-                    # Cancel pending tasks
-                    for task in pending:
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
-                    
-                    if valid_response:
-                        tx_sig = valid_response.json()["result"]
-                        request_url = valid_response.request.url if valid_response.request else ""
-                        jito_bundle_id = valid_response.headers.get("x-bundle-id") if request_url.startswith(JITO_RPC_URL) else None
-                        logger.info("🚀 Transaction Details:")
-                        logger.info(f"✅ Transaction sent successfully: {tx_sig}")
-                        if jito_bundle_id:
-                            logger.info(f"📦 Bundle ID: {jito_bundle_id}")
-
-                        try:
-                            # Wait for transaction confirmation before calculating fees
+                            # Wait for confirmation and process metrics
                             confirmation_result = await self.wait_for_confirmation(Signature.from_string(tx_sig))
                             if not confirmation_result:
                                 logger.error("Transaction failed to confirm")
-                                if attempt < max_retries - 1:
-                                    continue
-                                return {
-                                    "success": False,
-                                    "error": "Transaction failed to confirm",
-                                    "tx_sig": tx_sig,
-                                    "retries": attempt + 1
-                                }
+                                continue
 
-                            # Get actual fees from swap_data with fallbacks
-                            priority_fee_lamports = swap_data.get("prioritizationFeeLamports", PRIORITY_FEE_LAMPORTS)
-                            jito_tip_lamports = swap_data.get("jitoTipLamports", JITO_TIP_LAMPORTS)
+                            # Calculate fees and record metrics
+                            priority_fee = swap_result.get("prioritizationFeeLamports", PRIORITY_FEE_LAMPORTS)
+                            jito_tip = swap_result.get("jitoTipLamports", JITO_TIP_LAMPORTS)
                             
-                            # Calculate total route fees with safety checks
-                            total_route_fees = 0
-                            for route in quote.get('routePlan', []):
-                                try:
-                                    fee_amount = float(route['swapInfo']['feeAmount'])
-                                    fee_mint = route['swapInfo']['feeMint']
-                                    
-                                    # Skip system program fees (all zeros)
-                                    if fee_mint == "11111111111111111111111111111111":
-                                        continue
-                                        
-                                    # For SOL fees
-                                    if fee_mint == "So11111111111111111111111111111111111111112":
-                                        total_route_fees += fee_amount / 1e9
-                                        continue
-                                        
-                                    # For non-SOL fees, we need to get their SOL equivalent
-                                    try:
-                                        # Get quote to convert fee token to SOL
-                                        reverse_quote = await self._get_quote(
-                                            input_mint=fee_mint,
-                                            output_mint="So11111111111111111111111111111111111111112",
-                                            amount=int(fee_amount)  # Use original amount in base units
-                                        )
-                                        if reverse_quote and 'outAmount' in reverse_quote:
-                                            fee_in_sol = float(reverse_quote['outAmount']) / 1e9
-                                            total_route_fees += fee_in_sol
-                                    except Exception as e:
-                                        logger.warning(f"Failed to convert fee to SOL: {e}")
-                                        
-                                except (KeyError, ValueError, TypeError) as e:
-                                    logger.warning(f"Error calculating route fee: {e}")
-                                    continue
+                            # Calculate route fees
+                            total_route_fees = await self._calculate_route_fees(quote.get('routePlan', []))
+                            
+                            # Get SOL price
+                            sol_price = await self.get_sol_price()
+                            if sol_price is None or sol_price <= 0:
+                                sol_price = float(quote['swapUsdValue']) / (float(quote['inAmount']) / 1e9)
 
-                            # Calculate total fees in SOL
-                            total_fees_sol = (total_route_fees + (priority_fee_lamports + jito_tip_lamports) / 1e9)
+                            total_fees_sol = total_route_fees + (priority_fee + jito_tip) / 1e9
+                            total_fee_usd = total_fees_sol * sol_price
 
-                            # Get SOL price with fallback
+                            # Log RPC metrics
+                            logger.info(f"\n{'='*80}\n🔄 RPC Performance Metrics:\n")
+                            logger.info(f"• RPC Provider: {rpc_type}")
+                            logger.info(f"• Latency: {latency:.2f}ms")
+                            logger.info(f"• Compute Units: {swap_result.get('computeUnitLimit')}")
+                            logger.info(f"• Priority Fee: {priority_fee / 1e9:.6f} SOL")
+                            logger.info(f"\n{'='*80}")
+
+                            # Record metrics
                             try:
-                                sol_price = await self.get_sol_price()
-                                if sol_price is None or sol_price <= 0:
-                                    logger.warning("Invalid SOL price, using fallback from quote")
-                                    # Try to derive price from quote's USD value
-                                    if quote.get('swapUsdValue') and quote.get('inAmount'):
-                                        sol_price = float(quote['swapUsdValue']) / (float(quote['inAmount']) / 1e9)
-                                    else:
-                                        sol_price = 0
+                                metrics = RPCMetrics(
+                                    timestamp=datetime.utcnow(),
+                                    rpc_type=rpc_type,
+                                    latency_ms=latency,
+                                    success=True,
+                                    tx_signature=tx_sig,
+                                    route_count=len(quote.get('routePlan', [])),
+                                    slippage_bps=int(float(quote.get('slippageBps', 0))),
+                                    compute_units=swap_result.get('computeUnitLimit'),
+                                    priority_fee=priority_fee,
+                                    final_slippage_bps=int(swap_result.get('dynamicSlippageReport', {}).get('slippageBps', 100)),
+                                    total_fee_usd=total_fee_usd,
+                                    swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
+                                    retry_count=attempt,
+                                    slippage_adjustment=adjusted_slippage
+                                )
+                                await self.questdb.record_rpc_metrics(metrics)
                             except Exception as e:
-                                logger.warning(f"Error getting SOL price: {e}")
-                                sol_price = 0
-
-                            # Calculate total fee in USD with safety check
-                            total_fee_usd = total_fees_sol * sol_price if sol_price > 0 else 0
-
-                            # Log the fee calculation for debugging
-                            logger.info(f"Fee Calculation Details:")
-                            logger.info(f"- Total Route Fees (SOL): {total_route_fees}")
-                            logger.info(f"- Priority Fee (SOL): {priority_fee_lamports/1e9}")
-                            logger.info(f"- Jito Tip (SOL): {jito_tip_lamports/1e9}")
-                            logger.info(f"- Total Fees (SOL): {total_fees_sol}")
-                            logger.info(f"- SOL Price: ${sol_price}")
-                            logger.info(f"- Total Fees (USD): ${total_fee_usd}")
-
-                            # Create metrics object with safe values
-                            metrics = RPCMetrics(
-                                timestamp=datetime.utcnow(),
-                                rpc_type=rpc_type,
-                                latency_ms=latency or 0,
-                                success=True,
-                                tx_signature=tx_sig,
-                                route_count=len(quote.get('routePlan', [])),
-                                slippage_bps=int(float(quote.get('slippageBps', 0))),
-                                compute_units=swap_data.get('computeUnitLimit'),
-                                priority_fee=priority_fee_lamports,
-                                final_slippage_bps=int(swap_data.get('dynamicSlippageReport', {}).get('slippageBps', 100)),
-                                total_fee_usd=total_fee_usd,
-                                swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
-                                retry_count=attempt,
-                                slippage_adjustment=adjusted_slippage
-                            )
-
-                            self.questdb.record_rpc_metrics(metrics)
+                                logger.error(f"Failed to record success metrics: {str(e)}")
                             
                             return {
                                 "success": True,
                                 "tx_sig": tx_sig,
                                 "retries": attempt,
                                 "adjusted_slippage": adjusted_slippage,
-                                "dynamic_slippage_report": dynamic_slippage_report,
-                                "jito_bundle_id": jito_bundle_id,
+                                "dynamic_slippage_report": swap_result.get('dynamicSlippageReport'),
                                 "rpc_used": rpc_type,
                                 "rpc_latency": latency,
-                                "total_fee_usd": total_fee_usd
+                                "total_fee_usd": total_fee_usd,
+                                "compute_units": swap_result.get('computeUnitLimit'),
+                                "priority_fee": priority_fee,
+                                "jito_tip": jito_tip
                             }
-
-                        except Exception as e:
-                            logger.error(f"Error processing fees and metrics: {e}")
-                            # Record failed attempt in QuestDB
-                            metrics = RPCMetrics(
-                                timestamp=datetime.utcnow(),
-                                rpc_type=rpc_type or "unknown",
-                                latency_ms=latency or 0,
-                                success=False,
-                                tx_signature=tx_sig,
-                                route_count=len(quote.get('routePlan', [])),
-                                slippage_bps=int(adjusted_slippage * 10000),
-                                compute_units=swap_data.get('computeUnitLimit'),
-                                priority_fee=priority_fee_lamports,
-                                final_slippage_bps=None,
-                                total_fee_usd=0,
-                                swap_usd_value=float(fresh_quote.get('swapUsdValue', 0)),
-                                retry_count=attempt,
-                                slippage_adjustment=adjusted_slippage
-                            )
-                            self.questdb.record_rpc_metrics(metrics)
-                            
-                            if attempt < max_retries - 1:
-                                continue
-                            return {
-                                "success": False,
-                                "error": str(e),
-                                "tx_sig": tx_sig,
-                                "retries": attempt + 1
-                            }
-
-                else:
-                    logger.error("Unexpected transaction message format")
-                    return None
-                
+                except Exception as e:
+                    logger.error(f"Error processing transaction: {str(e)}")
+                    continue
+                    
             except Exception as e:
                 logger.error(f"Attempt {attempt+1} failed: {str(e)}")
                 if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay}s...")
-                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    await asyncio.sleep(0.1 * (attempt + 1))
                     
         logger.error(f"Transaction failed after {max_retries} attempts")
         return {
@@ -634,6 +627,41 @@ class TradingBot:
             "error": "Max retries exceeded",
             "retries": max_retries
         }
+
+    async def _calculate_route_fees(self, route_plan: List[dict]) -> float:
+        """Calculate total route fees in SOL."""
+        total_route_fees = 0
+        
+        for route in route_plan:
+            try:
+                fee_amount = float(route['swapInfo']['feeAmount'])
+                fee_mint = route['swapInfo']['feeMint']
+                
+                if fee_mint == "11111111111111111111111111111111":
+                    continue
+                    
+                if fee_mint == "So11111111111111111111111111111111111111112":
+                    total_route_fees += fee_amount / 1e9
+                    continue
+                    
+                # For non-SOL fees, get SOL equivalent
+                try:
+                    reverse_quote = await self._get_quote(
+                        input_mint=fee_mint,
+                        output_mint="So11111111111111111111111111111111111111112",
+                        amount=int(fee_amount)
+                    )
+                    if reverse_quote and 'outAmount' in reverse_quote:
+                        fee_in_sol = float(reverse_quote['outAmount']) / 1e9
+                        total_route_fees += fee_in_sol
+                except Exception as e:
+                    logger.warning(f"Failed to convert fee to SOL: {e}")
+                    
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(f"Error calculating route fee: {e}")
+                continue
+                
+        return total_route_fees
 
     async def _get_updated_quote(self, original_quote: dict, slippage: float) -> Optional[dict]:
         """Refresh quote with updated parameters."""
@@ -658,13 +686,13 @@ class TradingBot:
                 "limit": limit,
                 "offset": offset
             }
-            response = requests.get(url, params=params)
+            response = await self._fetch(url, params=params)
             
-            if not response.ok:
-                logger.error(f"Failed to get new tokens: Status {response.status_code}\nResponse: {response.text}")
+            if not response:
+                logger.error("Failed to get new tokens")
                 return None
                 
-            tokens = response.json()
+            tokens = response
             logger.info(f"\n{'='*80}\nNew Tokens Response:\n{json.dumps(tokens[:5], indent=2)}\n\nTotal tokens received: {len(tokens)}\n{'='*80}")
             
             # Transform response to match expected format
@@ -685,39 +713,48 @@ class TradingBot:
             return None
 
     async def get_token_info_batch(self, token_addresses: list) -> dict:
-        """Get token information for multiple tokens at once."""
+        """Get token information for multiple tokens concurrently."""
         token_info = {}
         
-        for address in token_addresses:
-            if address in self._token_cache:
-                token_info[address] = self._token_cache[address]
-                continue
-                
-            try:
+        # Filter out cached tokens and prepare tasks for uncached ones
+        uncached_addresses = [addr for addr in token_addresses if addr not in self._token_cache]
+        
+        if uncached_addresses:
+            tasks = []
+            for address in uncached_addresses:
                 validated_address = self._validate_address(address)
                 if not validated_address:
                     continue
                     
                 url = f"{self.jupiter_token_url}/token/{validated_address}"
-                response = requests.get(url)
-                
-                if response.ok:
-                    data = response.json()
+                tasks.append(self._fetch(url))
+            
+            # Execute all requests concurrently
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process responses
+            for address, response in zip(uncached_addresses, responses):
+                if isinstance(response, Exception):
+                    logger.error(f"Error fetching token info for {address}: {str(response)}")
+                    continue
+                    
+                if response:
                     info = {
-                        'symbol': data.get('symbol', '...'),
-                        'name': data.get('name', 'Unknown Token'),
-                        'decimals': data.get('decimals', 6)
+                        'symbol': response.get('symbol', '...'),
+                        'name': response.get('name', 'Unknown Token'),
+                        'decimals': response.get('decimals', 6)
                     }
                     token_info[address] = info
-                    self._token_cache[address] = info  # Cache the result
-                    
-                await asyncio.sleep(0.1)  # Small delay between requests
-                
-            except Exception as e:
-                logger.error(f"Error fetching token info for {address}: {str(e)}")
+                    self._token_cache[address] = info
+        
+        # Add cached tokens to result
+        for address in token_addresses:
+            if address in self._token_cache:
+                token_info[address] = self._token_cache[address]
+            elif address not in token_info:
                 token_info[address] = {'symbol': '...', 'name': 'Unknown Token', 'decimals': 6}
         
-        return token_info 
+        return token_info
 
     async def get_wallet_balance(self) -> float:
         """Get SOL balance of the wallet using Helius RPC"""
@@ -740,15 +777,9 @@ class TradingBot:
                 }
             }
 
-            response = requests.post(
-                HELIUS_RPC_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
-
-            if response.ok:
-                data = response.json()
-                native_balance = data.get("result", {}).get("nativeBalance", {})
+            response = await self._fetch(HELIUS_RPC_URL, method="post", json=payload)
+            if response:
+                native_balance = response.get("result", {}).get("nativeBalance", {})
                 return float(native_balance.get("lamports", 0)) / 1e9
             return 0.0
             
@@ -777,16 +808,11 @@ class TradingBot:
                 }
             }
 
-            response = requests.post(
-                HELIUS_RPC_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
-
+            response = await self._fetch(HELIUS_RPC_URL, method="post", json=payload)
             holdings = []
-            if response.ok:
-                data = response.json()
-                items = data.get("result", {}).get("items", [])
+            
+            if response:
+                items = response.get("result", {}).get("items", [])
                 
                 for item in items:
                     # Only process FungibleToken items
@@ -816,12 +842,10 @@ class TradingBot:
             # First attempt: Use Jupiter's price API
             url = f"{self.jupiter_price_url}/price"
             params = {'ids': self.sol_mint}
-            response = requests.get(url, params=params)
+            response = await self._fetch(url, params=params)
             
-            if response.ok:
-                data = response.json()
-                if 'data' in data and 'price' in data['data']:
-                    return float(data['data']['price'])
+            if response and 'data' in response and 'price' in response['data']:
+                return float(response['data']['price'])
             
             # Second attempt: Calculate from a 1 SOL to USDC quote
             usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -866,15 +890,9 @@ class TradingBot:
                 }
             }
 
-            response = requests.post(
-                HELIUS_RPC_URL,
-                json=payload,
-                headers={"Content-Type": "application/json"}
-            )
-
-            if response.ok:
-                data = response.json()
-                result = data.get("result", {})
+            response = await self._fetch(HELIUS_RPC_URL, method="post", json=payload)
+            if response:
+                result = response.get("result", {})
                 token_info = result.get("token_info", {})
                 
                 # Get total supply and price info
@@ -896,3 +914,37 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error getting token market cap: {str(e)}")
             return None 
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        try:
+            # Close thread pool
+            if hasattr(self, '_thread_pool'):
+                self._thread_pool.shutdown(wait=True)
+            
+            # Close all sessions
+            if hasattr(self, '_session_pool'):
+                for endpoint, session in self._session_pool.items():
+                    if not session.closed:
+                        try:
+                            await session.close()
+                            logger.info(f"Closed session for endpoint: {endpoint}")
+                        except Exception as e:
+                            logger.error(f"Error closing session for {endpoint}: {str(e)}")
+                self._session_pool.clear()
+            
+            # Close individual session if exists
+            if hasattr(self, '_session') and self._session and not self._session.closed:
+                await self._session.close()
+                logger.info("Closed individual session")
+                
+            # Clear latency history
+            if hasattr(self, '_latency_history'):
+                self._latency_history.clear()
+                
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+        finally:
+            # Ensure thread pool is shut down
+            if hasattr(self, '_thread_pool') and not self._thread_pool._shutdown:
+                self._thread_pool.shutdown(wait=False) 

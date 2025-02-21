@@ -46,14 +46,15 @@ def format_wallet_info(balance: float, token_holdings: list, sol_price: float = 
 async def interactive_swap_test():
     timestamp = datetime.now().strftime("%Y-%m-%d_%I-%M-%S_%p")
     logger = setup_logging(f"logs/test_swap_{timestamp}.log")
+    bot = None
     
-    # Get private key from environment
-    private_key_b58 = os.getenv("SOLANA_WALLET_PRIVATE_KEY")
-    if not private_key_b58:
-        console.print("[red]Error: SOLANA_WALLET_PRIVATE_KEY not found in environment[/red]")
-        return
-        
     try:
+        # Get private key from environment
+        private_key_b58 = os.getenv("SOLANA_WALLET_PRIVATE_KEY")
+        if not private_key_b58:
+            console.print("[red]Error: SOLANA_WALLET_PRIVATE_KEY not found in environment[/red]")
+            return
+        
         keypair = Keypair.from_base58_string(private_key_b58)
         bot = TradingBot(keypair)
         coingecko = CoinGeckoAPI()
@@ -98,7 +99,7 @@ async def interactive_swap_test():
                 
                 # Get token info and display
                 price_data = await bot.get_token_price(token_address)
-                liquidity = bot.check_liquidity(token_address)
+                liquidity = await bot.check_liquidity(token_address)
                 console.print(format_token_info(token_address, price_data, liquidity))
                 
                 if liquidity['has_liquidity']:
@@ -110,7 +111,7 @@ async def interactive_swap_test():
                     sol_amount = int((1.0 / sol_price) * 1e9)  # Convert to lamports
                     
                     # Get swap quote
-                    quote = bot.get_swap_quote(
+                    quote = await bot.get_swap_quote(
                         input_mint="So11111111111111111111111111111111111111112",
                         output_mint=token_address,
                         amount=sol_amount
@@ -271,8 +272,8 @@ async def interactive_swap_test():
                                 
                                 # Create RPC indicator based on which one was used
                                 rpc_indicator = (
-                                    "[bold yellow]⚡ JITO RPC[/bold yellow] (MEV Protected)" if rpc_used == "jito" else
-                                    "[bold cyan]🚀 HELIUS RPC[/bold cyan] (High Performance)" if rpc_used == "helius" else
+                                    "[bold yellow]⚡ JITO RPC[/bold yellow] (MEV Protected)" if "Jito" in rpc_used else
+                                    "[bold cyan]🚀 HELIUS RPC[/bold cyan] (High Performance)" if "Helius" in rpc_used else
                                     "[bold red]❓ UNKNOWN RPC[/bold red]"
                                 )
                                 
@@ -280,7 +281,7 @@ async def interactive_swap_test():
                                 tx_details = [
                                     "[green]Transaction sent successfully![/green]\n",
                                     f"{rpc_indicator}",
-                                    f"[dim]Transaction routed through fastest available RPC[/dim]\n",
+                                    f"[dim]Transaction routed through {rpc_used} RPC[/dim]\n",
                                     f"[white]Signature:[/white] {tx_sig}",
                                     f"[white]View on Solscan:[/white] https://solscan.io/tx/{tx_sig}"
                                 ]
@@ -419,6 +420,10 @@ async def interactive_swap_test():
     except Exception as e:
         console.print(f"[red]Error: {str(e)}[/red]")
         logger.error(f"Error during swap test: {str(e)}")
+    finally:
+        if bot and bot._session:
+            await bot._session.close()
+            logger.info("Session closed successfully")
 
 if __name__ == "__main__":
     asyncio.run(interactive_swap_test())
